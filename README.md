@@ -1,5 +1,7 @@
 # Sllhsmile Hyperf Elasticsearch
 
+当前稳定版本：`v0.0.2`
+
 面向 Hyperf 3.0+ 的 Elasticsearch 9 ORM 风格客户端。它在官方 `elasticsearch/elasticsearch:^9` 之上提供 Document Model、链式 Query Builder、Bulk、索引管理、PIT 和 Hyperf 官方协程 HTTP 接入。
 
 它不是关系型数据库 ORM，也不负责 MySQL 到 Elasticsearch 的自动同步。复杂 DSL 始终可以通过 `rawDsl()` 直接传递。
@@ -19,7 +21,7 @@
 ## 使用文档
 
 - [完整使用文档](https://github.com/sllhSmile/hyperf-elasticsearch/blob/main/USAGE.md)：每项公开功能的安装、配置、调用和注意事项。
-- 设计、开发阶段和进度文档仅在本地维护，不作为 Composer 用户文档发布。
+- [设计文档](https://github.com/sllhSmile/hyperf-elasticsearch/blob/main/DESIGN.md)：记录分阶段方案、实现流程和版本进度，面向开发维护，不作为 Composer 用户文档发布。
 
 发布说明：GitHub 保留 README 和 USAGE；Composer dist 按发布规则仅保留 README，USAGE 通过上方 GitHub 链接访问。
 
@@ -71,8 +73,8 @@ Handler 无需配置。包通过官方 `Hyperf\\Elasticsearch\\ClientBuilderFact
 | `connections` | 顶层 | 定义一个或多个命名连接 | 至少包含被使用的连接 |
 | `hosts` | 连接内 | Elasticsearch 节点 URL 列表 | `http://127.0.0.1:9200` |
 | `api_key` | 连接内 | API Key 认证 | 空；不能与 Basic Auth 同时配置 |
-| `username` | 连接内 | Basic Auth 用户名 | 空；需与 `password` 同时配置 |
-| `password` | 连接内 | Basic Auth 密码 | 空；请使用环境变量 |
+| `username` | 连接内 | Basic Auth 用户名 | 空；配置后必须同时配置 `password` |
+| `password` | 连接内 | Basic Auth 密码 | 空；配置后必须同时配置 `username`，请使用环境变量 |
 | `retries` | 连接内 | 节点请求失败后的重试次数 | `1`；`0` 表示不重试 |
 | `verify_tls` | 连接内 | HTTPS 证书校验；可填布尔值或 CA 文件路径 | `true` |
 | `headers` | 连接内 | 追加到每个 ES 请求的自定义 Header | `[]` |
@@ -148,8 +150,6 @@ foreach ($response as $article) {
 | 响应对象 | `SearchResponse`、`SearchHit` | [响应处理](https://github.com/sllhSmile/hyperf-elasticsearch/blob/main/USAGE.md#12-响应与异常) |
 
 每项方法的参数、返回值和请求体位置都在 USAGE.md 中给出。
-
-
 
 ## 许可证
 

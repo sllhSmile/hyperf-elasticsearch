@@ -15,7 +15,10 @@ final class PitManager
     /** 打开 PIT 并返回 ES 生成的 id；会发起网络请求。 */
     public function open(string $index, string $keepAlive = '1m'): string
     {
-        $response = $this->client->raw()->openPointInTime(['index' => $index, 'keep_alive' => $keepAlive]);
+        $response = $this->client->execute(static fn (object $client): mixed => $client->openPointInTime([
+            'index' => $index,
+            'keep_alive' => $keepAlive,
+        ]));
         $raw = is_object($response) && method_exists($response, 'asArray') ? $response->asArray() : (array) $response;
         if (! isset($raw['id'])) {
             throw new \RuntimeException('Elasticsearch did not return a PIT id.');
@@ -26,7 +29,9 @@ final class PitManager
     /** 关闭 PIT；ES9 要求 id 放在请求 body.id 中。 */
     public function close(string $pitId): mixed
     {
-        return $this->client->raw()->closePointInTime(['body' => ['id' => $pitId]]);
+        return $this->client->execute(static fn (object $client): mixed => $client->closePointInTime([
+            'body' => ['id' => $pitId],
+        ]));
     }
 
     /** 打开 PIT 执行回调，并在成功或异常时通过 finally 关闭。 */

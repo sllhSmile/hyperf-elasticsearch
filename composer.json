@@ -1,6 +1,6 @@
 {
     "name": "sllhsmile/hyperf-elasticsearch",
-    "version": "0.0.1",
+    "version": "0.0.2",
     "description": "Hyperf Elasticsearch ORM-style client and query builder.",
     "type": "library",
     "keywords": ["hyperf", "elasticsearch", "search", "orm", "query-builder"],

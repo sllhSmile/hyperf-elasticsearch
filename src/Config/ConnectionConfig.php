@@ -33,6 +33,11 @@ final class ConnectionConfig
         if ($this->apiKey !== null && ($this->username !== null || $this->password !== null)) {
             throw new ConfigurationException('ApiKey and basic authentication cannot be configured together.');
         }
+        $hasUsername = $this->username !== null && $this->username !== '';
+        $hasPassword = $this->password !== null && $this->password !== '';
+        if ($hasUsername xor $hasPassword) {
+            throw new ConfigurationException('Basic authentication requires both username and password.');
+        }
     }
 
     /** 从 Hyperf 配置数组读取并归一化连接参数。 */

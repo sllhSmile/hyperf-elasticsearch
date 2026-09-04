@@ -49,4 +49,14 @@ final class QueryBuilderTest extends TestCase
         self::assertTrue($dsl['track_total_hits']);
         self::assertSame('keyword', $dsl['runtime_mappings']['x']['type']);
     }
+
+    public function testSortOptionsCannotOverrideValidatedDirection(): void
+    {
+        $client = new ElasticsearchClient(new \stdClass());
+        $dsl = (new QueryBuilder($client, QueryArticle::class, 'articles'))
+            ->orderBy('published_at', 'asc', ['mode' => 'min', 'order' => 'invalid'])
+            ->toDsl();
+
+        self::assertSame(['published_at' => ['mode' => 'min', 'order' => 'asc']], $dsl['sort'][0]);
+    }
 }

@@ -48,6 +48,11 @@ Coroutine::create(fn () => Article::query()->count());
 
 HTTP 请求是否复用 TCP keep-alive 连接由 Handler 和服务端共同决定；业务代码不需要也不应该为每次查询手动 new 客户端。
 
+### Basic Auth 配置约束
+
+`username` 和 `password` 必须成对出现。只配置其中一个会在连接配置校验阶段抛出
+`ConfigurationException`，不会以未认证请求的方式继续访问 Elasticsearch。
+
 ## 4. DocumentModel
 
 ```php
@@ -119,6 +124,10 @@ $response = Article::query()
     ->toDsl();
 ```
 
+`orderBy($field, $direction, $options)` 只接受 `asc` 或 `desc`（大小写不敏感）。
+即使 `$options` 中包含 `order`，也不会覆盖已经校验的 `$direction`；其他排序选项如
+`mode`、`missing` 会原样保留。
+
 `toDsl(): array` 只编译，不访问网络；`replaceDsl` 会替换全部 raw DSL，`rawDsl` 则递归合并。`search(): SearchResponse` 将 DSL 放在 ES9 `body` 中；`get()` 是别名，`first()` 自动 `size(1)`，`count()` 自动 `size(0)` 并返回 `hits.total`。
 
 ## 8. 深分页与 PIT
@@ -148,7 +157,7 @@ $client->update(['index' => 'articles', 'id' => 'a-1', 'body' => ['doc' => ['vie
 $client->delete(['index' => 'articles', 'id' => 'a-2']);
 ```
 
-这些方法是官方 ES9 endpoint 的轻量转发，参数中的文档内容必须放 `body`；冲突、未找到或权限错误会由官方客户端异常传出。
+这些方法是官方 ES9 endpoint 的轻量转发，参数中的文档内容必须放 `body`；冲突、未找到或权限错误会由适配器统一转换为本包的 `ResponseException` 或 `TransportException`。
 
 ## 10. Bulk 批量操作
 
@@ -177,19 +186,34 @@ $indices->getMapping('articles-v1');
 $indices->putMapping('articles-v1', ['views' => ['type' => 'integer']]);
 $indices->getSettings('articles-v1');
 $indices->putSettings('articles-v1', ['refresh_interval' => '1s']);
-$indices->addAlias('articles-v1', 'articles');
+$indices->addAlias('articles-v1', 'articles', ['is_write_index' => true]);
 $indices->removeAlias('articles-v1', 'articles');
 $indices->switchAlias('articles', 'articles-v1', 'articles-v2');
 $indices->delete('articles-v1');
 ```
 
-create、putMapping、putSettings 和 updateAliases 的配置都放在 `body`；`switchAlias` 在一次 `updateAliases` 请求中同时 remove/add，保证原子切换。
+create、putMapping、putSettings 和 updateAliases 的配置都放在 `body`；Alias 的附加选项
+（例如 `is_write_index`、`filter`）放在 `actions[].add` 或 `actions[].remove` 内部，
+不会与 action 同级。示例中的 `addAlias` 最终会生成：
+
+```php
+['actions' => [['add' => [
+    'index' => 'articles-v1',
+    'alias' => 'articles',
+    'is_write_index' => true,
+]]]];
+```
+
+`switchAlias` 在一次 `updateAliases` 请求中同时 remove/add，保证原子切换。
 
 ## 12. 响应与异常
 
 `SearchResponse` 提供 `hits()`、`first()`、`total()`、`maxScore()`、`aggregations()`、`raw()`、`count()`，可直接 `foreach`。每个 `SearchHit` 提供 `source`、`id`、`score`、`sort`、`highlight` 和 `raw` 公共只读属性。
 
-配置错误抛 `ConfigurationException`，网络/传输错误抛 `TransportException`，服务端响应错误可捕获 `ResponseException` 并读取 `statusCode()`、`response()`。生产环境请记录 request id 和状态码，不要记录 ApiKey。
+配置错误抛 `ConfigurationException`，网络/传输错误抛 `TransportException`，服务端响应错误可捕获 `ResponseException` 并读取 `statusCode()`、`response()`。
+所有通过包内 endpoint（查询、写入、Bulk、索引、PIT）发出的请求都会统一转换为这些包内异常，
+并将官方异常保存在 `getPrevious()`；因此业务层可以稳定按包内类型捕获。`raw()` 是官方客户端
+逃生入口，直接调用时仍会得到官方客户端异常。生产环境请记录 request id 和状态码，不要记录 ApiKey。
 
 ## 13. 按 HTTP 方法发送 raw request 与测试
 
@@ -200,7 +224,7 @@ $client->requestPut('/articles-v2', [], ['settings' => ['number_of_shards' => 1]
 $client->requestDelete('/articles-v2');
 ```
 
-`requestGet/requestPost/requestPut/requestDelete` 会把 body 传给官方 endpoint，并对 info、search、mapping、index、document、bulk 路由做显式分派；不支持的路径抛 `BadMethodCallException`。本地测试运行：
+`requestGet/requestPost/requestPut/requestDelete` 会把 body 传给官方 endpoint，并对 info、search、mapping、index、document、bulk 路由做显式分派，同时严格校验 HTTP 方法：根路径只允许 GET，search 只允许 GET/POST，mapping 只允许 GET/PUT，bulk 只允许 POST，文档路径只允许 GET/PUT/POST/DELETE；不支持的组合抛 `BadMethodCallException`。本地测试运行：
 
 ```bash
 composer validate --no-check-publish --no-interaction

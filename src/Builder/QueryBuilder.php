@@ -163,7 +163,8 @@ final class QueryBuilder implements BuilderInterface
         if (! in_array($direction, ['asc', 'desc'], true)) {
             throw new \InvalidArgumentException('Sort direction must be asc or desc.');
         }
-        $this->body['sort'][] = $options === [] ? [$field => $direction] : [$field => array_replace(['order' => $direction], $options)];
+        // order 由 direction 统一控制，禁止 options 覆盖已校验的排序方向。
+        $this->body['sort'][] = $options === [] ? [$field => $direction] : [$field => array_replace($options, ['order' => $direction])];
         return $this;
     }
 

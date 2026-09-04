@@ -23,6 +23,12 @@ final class ConfigTest extends TestCase
         ConnectionConfig::fromArray(['hosts' => ['https://example.test'], 'api_key' => 'x', 'username' => 'u', 'password' => 'p']);
     }
 
+    public function testIncompleteBasicAuthenticationIsRejected(): void
+    {
+        $this->expectException(ConfigurationException::class);
+        ConnectionConfig::fromArray(['hosts' => ['https://example.test'], 'username' => 'u']);
+    }
+
     public function testConfigProviderUsesRootProviderAndPublishDirectory(): void
     {
         $config = (new ConfigProvider())();
