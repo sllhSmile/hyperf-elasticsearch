@@ -1,0 +1,5 @@
+# 设计总纲、阶段计划和本地进度仅在工作区维护，不提交 GitHub。
+DESIGN.md
+/vendor/
+/composer.lock
+/.phpunit.result.cache
