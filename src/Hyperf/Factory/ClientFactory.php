@@ -4,35 +4,56 @@ declare(strict_types=1);
 
 namespace SllhSmile\Elasticsearch\Hyperf\Factory;
 
+use Hyperf\Coroutine\Coroutine;
 use Hyperf\Elasticsearch\ClientBuilderFactory;
+use Hyperf\Guzzle\ClientFactory as GuzzleClientFactory;
+use Hyperf\Guzzle\RingPHP\CoroutineHandler;
 use Psr\Container\ContainerInterface;
+use SllhSmile\Elasticsearch\Adapter\AdapterFactory;
+use SllhSmile\Elasticsearch\Adapter\ClientMajor;
 use SllhSmile\Elasticsearch\Client\ElasticsearchClient;
 use SllhSmile\Elasticsearch\Config\ConnectionConfig;
 use SllhSmile\Elasticsearch\Exception\ConfigurationException;
 
-/**
- * 通过 Hyperf 官方 ClientBuilderFactory 创建 Elasticsearch 客户端。
- *
- * 官方工厂负责把 Hyperf Guzzle 客户端注入 ES Builder，并依据当前协程
- * 状态选择 CoroutineHandler/cURL 路径。本类只负责连接配置和 ORM 适配，
- * 不重复判断协程环境，也不自行创建 Guzzle Handler。
- */
+/** 通过匹配当前 Hyperf 版本的官方工厂创建 ES7/8/9 客户端。 */
 final class ClientFactory
 {
     public function __construct(private readonly ?ContainerInterface $container = null)
     {
     }
 
-    /** 返回延迟初始化的适配器，不会在这里发起网络请求。 */
+    /** 返回延迟初始化的客户端，实际 Builder 在第一次请求时创建。 */
     public function make(ConnectionConfig $config): ElasticsearchClient
     {
-        return new ElasticsearchClient(function () use ($config): object {
-            return $this->build($config);
-        });
+        return new ElasticsearchClient(fn (): object => $this->build($config));
     }
 
-    /** 在第一次 endpoint 调用时使用官方 Hyperf 工厂构建 ES 客户端。 */
     private function build(ConnectionConfig $config): object
+    {
+        $major = AdapterFactory::detectMajor();
+        $builder = $this->resolveBuilderFactory()->create();
+        $builder->setHosts($config->hosts);
+        $builder->setRetries($config->retries);
+
+        if ($major === ClientMajor::ES7) {
+            $this->configureElastic7($builder, $config);
+        } else {
+            $this->configureElastic8Or9($builder, $config);
+        }
+
+        $client = $builder->build();
+        if ($major !== ClientMajor::ES7) {
+            $transport = $client->getTransport();
+            foreach ($config->headers as $name => $value) {
+                if (is_string($name) && (is_string($value) || is_numeric($value))) {
+                    $transport->setHeader($name, (string) $value);
+                }
+            }
+        }
+        return $client;
+    }
+
+    private function resolveBuilderFactory(): ClientBuilderFactory
     {
         if ($this->container === null) {
             throw new ConfigurationException(
@@ -41,46 +62,92 @@ final class ClientFactory
         }
 
         try {
-            /** @var ClientBuilderFactory $factory */
             $factory = $this->container->get(ClientBuilderFactory::class);
-        } catch (\Throwable $e) {
+        } catch (\Throwable $exception) {
             throw new ConfigurationException(
-                'Unable to resolve Hyperf Elasticsearch ClientBuilderFactory; install hyperf/elasticsearch.',
+                'Unable to resolve Hyperf Elasticsearch ClientBuilderFactory.',
                 0,
-                $e,
+                $exception,
             );
         }
-
         if (! $factory instanceof ClientBuilderFactory) {
             throw new ConfigurationException('Hyperf Elasticsearch ClientBuilderFactory binding is invalid.');
         }
+        return $factory;
+    }
 
-        $builder = $factory->create()
-            ->setHosts($config->hosts)
-            ->setRetries($config->retries);
+    /** ES7 使用 RingPHP handler；连接参数必须在认证设置之前写入。 */
+    private function configureElastic7(object $builder, ConnectionConfig $config): void
+    {
+        $headers = $this->normalizeElastic7Headers($config->headers);
+        if ($config->apiKey !== null) {
+            // ES7 setApiKey() 要求 id、secret 两个参数；直接使用跨版本一致的 encoded key。
+            $headers['Authorization'] = ['ApiKey ' . $config->apiKey];
+        }
+        $clientOptions = array_replace($config->clientOptions, [
+            'timeout' => $config->timeout,
+            'connect_timeout' => $config->connectTimeout,
+            'headers' => array_replace(
+                (array) ($config->clientOptions['headers'] ?? []),
+                $headers,
+            ),
+        ]);
+        $builder->setConnectionParams(['client' => $clientOptions]);
+
+        if ($config->username !== null && $config->password !== null) {
+            $builder->setBasicAuthentication($config->username, $config->password);
+        }
+        $builder->setSSLVerification($config->verifyTls);
+
+        // Hyperf 3.0/3.1 的 CoroutineHandler 只从构造参数读取请求超时。
+        if (class_exists(Coroutine::class) && Coroutine::inCoroutine()) {
+            $builder->setHandler(new CoroutineHandler(['timeout' => $config->timeout]));
+        }
+    }
+
+    /** ES8/9 必须一次性创建带 Handler、超时和 TLS 的 Guzzle client。 */
+    private function configureElastic8Or9(object $builder, ConnectionConfig $config): void
+    {
+        $httpOptions = array_replace($config->clientOptions, [
+            'timeout' => $config->timeout,
+            'connect_timeout' => $config->connectTimeout,
+            'verify' => $config->verifyTls,
+            'headers' => array_replace(
+                (array) ($config->clientOptions['headers'] ?? []),
+                $config->headers,
+            ),
+        ]);
+        $builder->setHttpClient($this->resolveGuzzleFactory()->create($httpOptions));
 
         if ($config->apiKey !== null) {
             $builder->setApiKey($config->apiKey);
         } elseif ($config->username !== null && $config->password !== null) {
             $builder->setBasicAuthentication($config->username, $config->password);
         }
+    }
 
-        if (is_bool($config->verifyTls)) {
-            $builder->setSSLVerification($config->verifyTls);
-        } elseif (is_string($config->verifyTls)) {
-            $builder->setCABundle($config->verifyTls);
+    private function resolveGuzzleFactory(): GuzzleClientFactory
+    {
+        if ($this->container === null || ! $this->container->has(GuzzleClientFactory::class)) {
+            throw new ConfigurationException('Unable to resolve Hyperf Guzzle ClientFactory.');
         }
+        $factory = $this->container->get(GuzzleClientFactory::class);
+        if (! $factory instanceof GuzzleClientFactory) {
+            throw new ConfigurationException('Hyperf Guzzle ClientFactory binding is invalid.');
+        }
+        return $factory;
+    }
 
-        // setHttpClientOptions() 会通过适配器重建 Guzzle 客户端，可能丢失
-        // Hyperf Handler 和 sdklog AOP，因此不在这里调用。自定义 headers
-        // 可在 Transport 层追加，不会重建底层 HTTP 客户端。
-        $client = $builder->build();
-        foreach ($config->headers as $name => $value) {
-            if (is_string($name) && (is_string($value) || is_numeric($value))) {
-                $client->getTransport()->setHeader($name, (string) $value);
+    /** @return array<string, list<string>> */
+    private function normalizeElastic7Headers(array $headers): array
+    {
+        $normalized = [];
+        foreach ($headers as $name => $value) {
+            if (! is_string($name) || (! is_string($value) && ! is_numeric($value))) {
+                continue;
             }
+            $normalized[$name] = [(string) $value];
         }
-
-        return $client;
+        return $normalized;
     }
 }

@@ -11,24 +11,24 @@
 - 原生 DSL 的组合与逃生；
 - 搜索、写入、批量操作；
 - 索引、mapping、alias 的基础生命周期管理；
-- 可替换的客户端/Transport。Hyperf 优先复用官方 `hyperf/elasticsearch` 工厂及其协程 Handler，避免重复实现客户端和阻塞 Worker。
+- 可替换的客户端/Transport。Hyperf 通过本包的 ClientFactory 复用 `hyperf/elasticsearch` 与 `hyperf/guzzle` 的协程 HTTP 能力，避免重复实现 HTTP 传输和阻塞 Worker。
 
 ### 1.2 明确不做的事情
 
 - 不实现 MySQL/关系型数据库到 ES 的自动同步、Observer、队列一致性和双写；
 - 不承诺完全复刻 Eloquent 的关系、事务和懒加载语义；
 - 不隐藏 Elasticsearch 的全部能力，复杂功能必须能通过 raw DSL 使用；
-- 第一版只支持 Elasticsearch 9.x；ES 8/7 和 OpenSearch 留作后续适配。
+- 支持 Elasticsearch 7.17、8.x、9.x；OpenSearch 留作后续适配。
 - 第一版不实现 Laravel 集成。
 
 ## 2. 兼容矩阵（第一版）
 
 | 组件 | 第一版支持 | 说明 |
 | --- | --- | --- |
-| PHP | `>=8.1` | 代码避免使用 PHP 8.2 专属语法，便于 Hyperf 3.0 与 Laravel 10；Laravel 11 项目使用 PHP 8.2+。 |
-| Elasticsearch | 首发 9.x；规划 8.x、7.x | 首发以官方 `elasticsearch/elasticsearch` 9.x 为基线，同时从 Core 契约开始隔离 7/8/9 的客户端差异。 |
-| Hyperf | `^3.0`（包括 3.0+ 后续小版本） | 通过 ConfigProvider、DI；框架版本差异放入 Bridge 层。 |
-| HTTP/客户端 | 官方 `elasticsearch/elasticsearch:^9` + Hyperf Guzzle 协程 Handler | 通过 Transport 契约隔离；不把 `hyperf/elasticsearch` 作为首版硬依赖。 |
+| PHP | `>=8.1` | 代码避免使用 PHP 8.2 专属语法；Hyperf 3.2 本身要求 PHP 8.2+。 |
+| Elasticsearch | 7.17.x、8.x、9.x | 由宿主只安装一个官方客户端主版本，Adapter 统一 Core API。 |
+| Hyperf | `^3.0` | 3.0/3.1 对应 ES7，3.2 对应 ES8/9；通过 ConfigProvider、DI 接入。 |
+| HTTP/客户端 | 官方 7/8/9 客户端 + `hyperf/elasticsearch:^3.0` | Composer 根据 Hyperf 和 ES 约束选择 3.0、3.1 或 3.2 分支。 |
 
 ES 7/8/9 作为独立客户端主版本适配，不在运行时混装。OpenSearch 仍需另建兼容层和 CI 矩阵，不在上述承诺内。
 
@@ -92,7 +92,31 @@ Article::query()->rawDsl([
 ])->search();
 ```
 
-### 4.2 不模拟关系型语义
+### 4.2 DocumentModel ORM 生命周期
+
+ORM API 是 Core 层能力，不依赖 Laravel/Eloquent，也不把 Elasticsearch 伪装成事务型数据库：
+
+```text
+Model::create(attributes, id)
+  -> new model + fill/casts
+  -> Query/Client adapter index
+  -> response _id -> hydrated model (exists=true)
+
+Model::find(id)
+  -> adapter get(index, id)
+  -> 404 -> null; _source -> fill/casts -> model
+
+model->update(attributes)->save()
+  -> fill/casts -> index complete document
+model->delete()
+  -> adapter delete(index, id) -> exists=false
+```
+
+`save()` 是 Elasticsearch `index` 覆盖写入，不表示数据库事务；`update()` 是填充属性后保存
+完整文档的便捷 API。`QueryBuilder::create()` 与 `Model::create()` 共享同一个模型类、连接和
+adapter，控制器不得绕过 ORM 为常规文档操作直接拼接官方客户端请求。
+
+### 4.3 不模拟关系型语义
 
 - `where` 默认映射为 filter/term 语义时要明确命名，全文检索使用 `whereMatch` 等方法；
 - `save()` 表示写入 ES 文档，不表示数据库事务；
@@ -110,7 +134,9 @@ Model 可以声明 `indexName()`、`mapping()`、`settings()`。第一版不根�
 - `$documentId` 与 `_source` 映射；
 - `getIndexName()`、`mapping()`、`settings()`；
 - 属性白名单/黑名单和基本 cast；
-- `newFromHit()` 将搜索 hit 转成模型；
+- `create`、`save`、`find`、`update`、`delete` 文档生命周期；
+- `fromSearchHit()` 将搜索 hit 转成模型；
+- 404 在模型 `find()` 边界转换为 `null`，其余响应错误保留统一异常；
 - 明确区分 `_source`、`_id`、`_score`、`sort`、highlight 和 aggregation。
 
 ### 5.2 Query Builder
@@ -145,14 +171,14 @@ Model 可以声明 `indexName()`、`mapping()`、`settings()`。第一版不根�
 
 定义统一传输契约；当前公开客户端按 HTTP 动词提供 `requestGet/requestPost/requestPut/requestDelete`，内部仍由统一 dispatch 处理 endpoint 路由。
 
-**采用官方实现，而不是重写 Handler。** Hyperf 官方文档表明，`hyperf/elasticsearch` 的 `ClientBuilderFactory` 会基于 `elasticsearch-php` 创建客户端；在协程环境中会自动使用 `hyperf/guzzle` 的协程 Handler。本包不再暴露连接池配置。
+**采用 Hyperf 官方客户端工厂，而不是重写 HTTP Handler。** `hyperf/elasticsearch` 3.0/3.1 绑定 ES7 并使用 RingPHP 协程 Handler，3.2 绑定 ES8/9 并使用 Hyperf Guzzle。本包在两条分支上只补充统一连接配置，不暴露连接池配置。
 
 因此第一版的实现策略是：
 
 1. Core 只依赖 `ClientInterface`/`TransportInterface`，不依赖框架和某个 ES 主版本；
-2. Hyperf Bridge 面向 Hyperf 框架 `^3.0`，直接使用官方 ES9 `ClientBuilder`；
-4. 若宿主的 `hyperf/elasticsearch` 包版本与目标 ES PHP client 主版本存在 Composer 冲突，本包直接适配官方 `elasticsearch/elasticsearch`，复用 Hyperf Guzzle 工厂，不把 `hyperf/elasticsearch` 作为硬依赖；
-5. 这使 Hyperf 3.0+ 可以按同一套 Core API 连接 ES 7/8/9，官方工厂和独立 adapter 的实际组合必须分别跑集成测试；
+2. Hyperf Bridge 面向 Hyperf 框架 `^3.0`，按已安装客户端主版本配置官方 ClientBuilder；
+4. Composer 通过 `hyperf/elasticsearch:^3.0` 和官方客户端联合约束自动选择兼容组合；
+5. Hyperf 3.0/3.1 + ES7 与 Hyperf 3.2 + ES8/9 使用同一套 Core API，并分别跑依赖矩阵测试；
 6. Handler 不作为业务配置项，统一复用官方 Hyperf Guzzle 工厂的自动选择逻辑；
 7. 只有官方客户端无法满足某个扩展点时，才实现薄的 adapter，不复制 HTTP、认证、节点选择和重试逻辑。
 
@@ -168,16 +194,13 @@ Model 可以声明 `indexName()`、`mapping()`、`settings()`。第一版不根�
 | [ruflin/Elastica](https://github.com/ruflin/Elastica) | Query/Filter/Document/Index 的对象化 DSL，成熟的响应抽象 | 自身不是 Laravel/Hyperf 集成层；再套一层会增加依赖和抽象重叠 |
 | [matchish/laravel-scout-elasticsearch](https://github.com/matchish/laravel-scout-elasticsearch) | 可参考搜索入口设计 | 本项目第一版不实现 Laravel/Scout 集成 |
 
-取舍结论：底层使用官方 ES9 客户端；Hyperf 使用官方 Guzzle 协程 Handler；Elastica 的对象化 DSL 仅借鉴节点设计；Laravel/Scout 仅作参考，不进入首版代码。
+取舍结论：底层使用宿主选择的官方 ES7/8/9 客户端；Hyperf 使用官方 Guzzle 协程 Handler；Elastica 的对象化 DSL 仅借鉴节点设计；Laravel/Scout 仅作参考，不进入首版代码。
 
 ## 7. 后续版本兼容策略
 
-### 7.1 Composer 依赖原则（后续 ES 8/7）
+### 7.1 Composer 依赖原则（ES 7/8/9）
 
-不能在一个强制依赖中同时要求 `elasticsearch/elasticsearch:^7|^8|^9` 并假设 API 完全一致。第一版应采用以下任一落地方式，并在阶段 0 做 Spike 选择：
-
-- **推荐：可选适配包**：`sllhsmile/hyperf-elasticsearch` 只依赖 PSR 契约；由宿主选择 `sllhsmile/elasticsearch-client7`、`-client8` 或 `-client9`。Laravel/Hyperf bridge 再声明对应的 `provide`/`conflict` 约束；
-- **单包可选依赖**：核心包将 7/8/9 客户端列为 `suggest`，运行时检测主版本并加载对应 adapter。此方式安装简单，但静态分析和依赖冲突更难控制。
+不能在一个运行实例中同时安装多个 `elasticsearch/elasticsearch` 主版本。当前同时约束 `elasticsearch/elasticsearch:^7.17 || ^8 || ^9` 与 `hyperf/elasticsearch:^3.0`：Composer 会为 Hyperf 3.0/3.1 选择 ES7 分支，为 Hyperf 3.2 选择 ES8/9 分支，运行时再加载对应 adapter。
 
 首版不应让 Composer 同时安装多个官方客户端主版本；一个运行实例只绑定一个 ES PHP 客户端主版本。
 
@@ -185,9 +208,11 @@ Model 可以声明 `indexName()`、`mapping()`、`settings()`。第一版不根�
 
 | 框架 | ES 7 + client 7 | ES 8 + client 8 | ES 9 + client 9 |
 | --- | --- | --- | --- |
-| Laravel 10（PHP 8.1+） | 支持 | 支持 | 支持 |
-| Laravel 11（PHP 8.2+） | 支持 | 支持 | 支持 |
-| Hyperf 3.0+ | 官方 `hyperf/elasticsearch` 或本包 Hyperf 协程 adapter | 官方 `hyperf/elasticsearch`（若依赖兼容）或本包 Hyperf 协程 adapter | 官方 `hyperf/elasticsearch`（若依赖兼容）或本包 Hyperf 协程 adapter |
+| Laravel 10（PHP 8.1+） | 不支持 | 不支持 | 不支持 |
+| Laravel 11（PHP 8.2+） | 不支持 | 不支持 | 不支持 |
+| Hyperf 3.0 | `hyperf/elasticsearch` 3.0 | 不支持 | 不支持 |
+| Hyperf 3.1 | `hyperf/elasticsearch` 3.1 | 不支持 | 不支持 |
+| Hyperf 3.2 | 不支持 | `hyperf/elasticsearch` 3.2 | `hyperf/elasticsearch` 3.2 |
 
 这里的“支持”必须以对应 CI 组合和 Docker 集成测试为准；ES 服务端与 PHP 客户端主版本不是同一个版本号，文档必须分开描述。
 
@@ -221,7 +246,7 @@ return [
 ];
 ```
 
-Hyperf 使用 `config/autoload/elasticsearch.php`、ConfigProvider、DI 定义和 `bin/hyperf.php` 命令。配置包含 hosts、认证、超时、重试和 TLS 参数，Handler 由官方 Guzzle 工厂自动选择。
+Hyperf 使用 `config/autoload/elasticsearch.php`、ConfigProvider、DI 定义和 `bin/hyperf.php` 命令。配置包含 hosts、认证、超时、重试和 TLS 参数，Handler 由匹配版本的 `hyperf/elasticsearch` 工厂选择。
 
 ## 9. 测试与质量门槛
 
@@ -231,7 +256,7 @@ Hyperf 使用 `config/autoload/elasticsearch.php`、ConfigProvider、DI 定义�
 - Hyperf 协程测试：并发、超时、取消、连接复用；
 - 静态检查：PHPStan/Psalm 任选其一，PHP-CS-Fixer；
 - 每个新增 DSL 节点配请求快照测试，避免链式 API 静默生成错误 JSON；
-- CI 至少覆盖 PHP 8.1、8.2、8.3 与 Hyperf 3.0+ 的允许组合；首版只跑 ES 9.x 集成测试。
+- CI 至少覆盖 Hyperf 3.0/3.1 + ES7 与 Hyperf 3.2 + ES8/9 的允许组合。
 
 ## 10. 关键风险与决策
 
@@ -243,7 +268,7 @@ Hyperf 使用 `config/autoload/elasticsearch.php`、ConfigProvider、DI 定义�
 | 深分页误用 | 查询变慢或超限 | 首版文档和 API 强制区分浅分页、search_after、PIT |
 | Hyperf 阻塞 IO | Worker 吞吐下降 | 复用 `hyperf/elasticsearch` 官方 Guzzle Handler；并发/超时测试验证 |
 | ES PHP 客户端 7/8/9 API 漂移 | 请求、响应和异常不兼容 | 版本适配层隔离；单实例只绑定一个主版本 |
-| `hyperf/elasticsearch` 包版本与 client 主版本绑定 | 某些 Hyperf 3.x 项目无法直接安装 client 9 | 将官方包作为可选工厂；冲突时由本包直接注入 Hyperf 协程 Handler 到官方 client 7/8/9 |
+| `hyperf/elasticsearch` 包版本与 client 主版本绑定 | 不兼容组合无法安装 | 用 Composer 联合约束限定为 3.0/3.1 + ES7 或 3.2 + ES8/9，并跑依赖矩阵测试 |
 | 包范围失控 | 迟迟无法发布 | MVP 只覆盖查询、写入、基础索引管理和 raw DSL |
 
 ## 10. 成功标准
@@ -261,7 +286,12 @@ Hyperf 使用 `config/autoload/elasticsearch.php`、ConfigProvider、DI 定义�
 
 Composer 通过 PSR-4 加载源码，并读取 `extra.hyperf.config` 指向 `src/ConfigProvider.php`。ConfigProvider 注册 Manager、ClientFactory 和默认客户端绑定，同时把 `publish/elasticsearch.php` 发布到宿主 `config/autoload/elasticsearch.php`。
 
-Manager 按连接名懒加载并缓存 ElasticsearchClient；ClientFactory 延迟调用官方 Hyperf Guzzle 工厂，再交给官方 ES9 ClientBuilder。QueryBuilder 只累积查询状态，search 时将 DSL 放入 body；SearchResponse 再把命中转换成 SearchHit 或 DocumentModel。Bulk 使用 metadata/source 行组织 NDJSON，IndexManager 和 PitManager 按 ES9 endpoint 要求把配置和 PIT id 放在 body 中。
+Manager 按连接名懒加载并缓存 ElasticsearchClient；ClientFactory 延迟调用 Hyperf Guzzle 工厂，再交给 ES7/8/9 对应 ClientBuilder。QueryBuilder 只累积查询状态，search 时将 DSL 放入 body；SearchResponse 再把命中转换成 SearchHit 或 DocumentModel。Bulk 使用 metadata/source 行组织 NDJSON，IndexManager 和 PitManager 使用各版本通用 endpoint body 语义。
+
+长驻 Worker 的故障恢复边界：官方 Transport 在网络超时后可能把单节点标记为 dead；
+`ElasticsearchClient` 捕获 `TransportException` 后清理 adapter，后续请求通过延迟工厂重建
+官方 client 和 node pool。当前失败请求不自动重放，避免写入请求因响应丢失而重复提交；重试次数
+仍由官方 Transport 的 `retries` 配置控制。
 
 ## 12. 分阶段计划与当前进度
 
@@ -277,12 +307,13 @@ Manager 按连接名懒加载并缓存 ElasticsearchClient；ClientFactory 延�
 | 7 | Hyperf 宿主集成、README、USAGE | 已完成 |
 | 8 | 默认连接与模型 `$connection` 自动解析 | 已完成 |
 | 9 | requestGet/requestPost/requestPut/requestDelete API | 已完成 |
+| 10 | DocumentModel ORM CRUD、QueryBuilder 写入和 Hyperf 测试接口 | 已完成 |
 
 验收以 PHPUnit、PHP lint、Composer validate 和 Hyperf CLI 为准；云端 ES 9.6 与真实协程压力测试需使用用户轮换后的安全凭据。
 
 ## 13. 关键决策记录
 
-- 首版只支持 Hyperf 3.0+、PHP 8.1+ 和官方 Elasticsearch PHP Client 9；ES 7/8 通过后续独立 adapter 扩展。
+- 支持 Hyperf 3.0+、PHP 8.1+ 和官方 Elasticsearch PHP Client 7/8/9；一个运行实例只绑定一个主版本，版本差异集中在 adapter。
 - 首版不实现 Laravel 集成和 MySQL 自动同步，不承诺 Eloquent 完整兼容。
 - 默认连接名为 `default`，模型通过 `$connection` 属性选择连接，业务日常使用 `Article::query()`。
 - Hyperf 协程请求使用官方 Guzzle 工厂自动选择 CoroutineHandler 或 cURL 路径。
@@ -298,42 +329,59 @@ Manager 按连接名懒加载并缓存 ElasticsearchClient；ClientFactory 延�
 
 ## 15. 最新进度（2026-09-04）
 
-- 已按 Hyperf 官方 `ClientBuilderFactory` 的 Guzzle 工厂路径重构 `ClientFactory`。
+- 已按 Hyperf 官方 Guzzle 工厂路径重构 `ClientFactory`。
 - 已将 `ElasticsearchClient` 改为首次 endpoint 调用时延迟初始化，避免 Worker 启动阶段固定同步 Handler。
 - 已移除包配置中的连接池、`handler` 和 `max_connections` 字段；默认行为统一由官方工厂自动选择。
 - 已移除宿主测试控制器中对 ES9 不存在的 `setHandler()` 和 `PoolHandler` 调用。
 - 验收：包 PHPUnit 14 tests / 38 assertions、宿主 PHP lint、Composer autoload 和 Hyperf CLI 通过。
-- 已进一步改为直接依赖并调用 Hyperf 官方 `ClientBuilderFactory`；不再自行 new Guzzle 客户端或判断协程环境。
-- `timeout`、`connect_timeout`、`client_options` 不通过 `setHttpClientOptions()` 注入，避免 ES9 Builder 重建客户端并丢失协程 Handler/AOP；自定义 headers 通过 Transport 安全追加。
+- ClientFactory 复用 `hyperf/elasticsearch` 的 ClientBuilderFactory：3.0/3.1 提供 ES7 RingPHP Builder，3.2 提供 ES8/9 PSR-18 Builder。
+- ES8/9 的 `timeout`、`connect_timeout`、TLS 和 `client_options` 在 Hyperf Guzzle client 创建时统一注入，不调用会重建客户端的 Builder option API；ES7 则使用 RingPHP connection params。
 
-## 16. v0.0.2 修复记录（2026-09-04）
+## 16. ORM 完善进度
+
+- `DocumentModel` 已提供 `create`、`save`、`find`、`update`、`delete`，保留 `exists`、`getKey`、`toArray`、casts 和连接自动解析。
+- `find` 将 ES HTTP 404 转换为 `null`；ES7 的数组响应与 ES8/9 的 Response 对象统一由 adapter 数组化。
+- `QueryBuilder::create/insert` 与模型使用同一个 adapter，链式查询返回 hydrate 后的模型数组。
+- Hyperf `IndexController` 的测试接口只调用 `ElasticsearchTestModel`/`QueryBuilder`，覆盖写入、按 ID 读取和链式搜索；该控制器不作为正式业务 API。
+
+## 17. v0.0.2 修复记录（2026-09-04）
 
 本节记录本次代码审查后的具体实现变更，README 仅保留用户安装、配置和功能入口说明。
 
-### 16.1 请求体与 endpoint 语义
+### 17.1 请求体与 endpoint 语义
 
 - `QueryBuilder::search()` 将完整查询 DSL 放入官方客户端参数的 `body`，避免 `query`、`aggs`、`highlight` 等字段被错误当作 URL 参数而丢失。
 - `IndexManager` 的 `create`、`putMapping`、`putSettings`、`updateAliases` 统一使用 `body`；PIT 关闭请求使用 `body.id`。
 - Alias 的 `is_write_index`、`filter` 等选项嵌套到 `actions[].add`/`actions[].remove`，并固定目标 `index` 与 `alias` 不允许被 options 覆盖。
 
-### 16.2 配置校验与异常边界
+### 17.2 配置校验与异常边界
 
 - Basic Auth 的 `username`、`password` 必须成对配置；部分配置在 `ConnectionConfig` 校验阶段抛出 `ConfigurationException`，防止请求静默缺少认证。
 - endpoint 调用统一经过 `ElasticsearchClient::execute()`：官方响应错误转换为包内 `ResponseException`，传输/HTTP 客户端错误转换为 `TransportException`，其余官方异常转换为基础 `ElasticsearchException`，原始异常保存在 `getPrevious()`。
 - `raw()` 保留为官方客户端逃生入口，不做异常适配，便于高级用户直接使用官方异常类型。
 
-### 16.3 通用 request 路由安全性
+### 17.3 通用 request 路由安全性
 
 - `requestGet/requestPost/requestPut/requestDelete` 对根路径、search、mapping、bulk、索引和文档路径执行显式 HTTP 方法白名单校验。
 - 不支持的方法统一抛出 `BadMethodCallException`，不会再把 DELETE mapping 错误分派为 `putMapping`。
 
-### 16.4 查询参数完整性
+### 17.4 查询参数完整性
 
 - `minimumShouldMatch(int|string)` 保留百分比和条件表达式字符串语义。
 - `orderBy()` 先校验 `$direction`，再合并额外 options；options 中的 `order` 不得覆盖已校验方向，其他排序参数仍然保留。
 
-### 16.5 验证结果
+### 17.5 验证结果
 
 - PHPUnit：19 tests / 45 assertions 通过。
 - 关键源码 PHP lint 和 `git diff --check` 通过。
 - Composer 1 环境无法解析 ES9/Hyperf 依赖，`composer validate` 仅提示锁文件与版本字段警告；依赖解析应使用 Composer 2。
+
+## 18. 7/8/9 统一适配实现（2026-09-07）
+
+当前实现采用单包多版本策略：Core API 只依赖 `ClientInterface`，官方客户端差异集中在 `Adapter/Elastic7Adapter`、`Elastic8Adapter` 和 `Elastic9Adapter`。一个运行实例只能安装一个 `elasticsearch/elasticsearch` 主版本。
+
+包依赖 `hyperf/elasticsearch:^3.0` 与官方客户端 `^7.17 || ^8 || ^9`；Composer 根据 Hyperf 版本选择兼容组合，运行时由 `AdapterFactory` 检测实际官方客户端主版本。
+
+ES7 使用 `Elasticsearch\\ClientBuilder`，ES8/9 使用 `Elastic\\Elasticsearch\\ClientBuilder`；版本差异只允许出现在 Adapter 和 Factory。Core 统一处理 endpoint operation、响应数组化、异常、Bulk、PIT 和索引管理。
+
+`QueryBuilder::first()` 和 `count()` 使用独立 clone，不污染原查询；`rawDsl()` 不允许覆盖链式 API 已生成的顶层 DSL，完整覆盖使用 `replaceDsl()`。`timeout`、`connect_timeout` 和 `client_options` 会传入 Hyperf Guzzle。

@@ -7,13 +7,16 @@ namespace SllhSmile\Elasticsearch\Model;
 use DateTimeInterface;
 use Hyperf\Context\ApplicationContext;
 use SllhSmile\Elasticsearch\Builder\QueryBuilder;
-use SllhSmile\Elasticsearch\Client\ElasticsearchClient;
+use SllhSmile\Elasticsearch\Contract\ClientInterface;
+use SllhSmile\Elasticsearch\Exception\ResponseException;
 use SllhSmile\Elasticsearch\Hyperf\Manager;
 use SllhSmile\Elasticsearch\Response\SearchHit;
 
 /**
  * 面向 Elasticsearch 文档的轻量模型基类，不依赖 Laravel/Eloquent。
  * 子类声明 index 和 casts，即可获得属性转换、命中元数据及 QueryBuilder 入口。
+ *
+ * @phpstan-consistent-constructor
  */
 abstract class DocumentModel
 {
@@ -38,7 +41,7 @@ abstract class DocumentModel
 
     protected array $highlight = [];
 
-    /** @var array<class-string, ElasticsearchClient> */
+    /** @var array<class-string, ClientInterface> */
     private static array $clients = [];
 
     /** 创建模型并填充初始属性；不会访问网络。 */
@@ -66,6 +69,13 @@ abstract class DocumentModel
     public function getKey(): ?string
     {
         return $this->documentId;
+    }
+
+    /** 设置 Elasticsearch 文档 ID，便于链式构造后保存。 */
+    public function setKey(string $id): static
+    {
+        $this->documentId = $id;
+        return $this;
     }
 
     /** 判断模型是否来自 ES 命中，而非新建对象。 */
@@ -130,6 +140,82 @@ abstract class DocumentModel
         return $this->toArray();
     }
 
+    /** 创建并写入一个新文档，返回已标记为存在的模型实例。 */
+    public static function create(array $attributes, ?string $id = null, ?ClientInterface $client = null, array $options = []): static
+    {
+        $model = new static($attributes);
+        if ($id !== null) {
+            $model->setKey($id);
+        }
+        return $model->save($client, $options);
+    }
+
+    /** 保存当前文档；有 ID 时执行 index 覆盖写入，否则由 ES 自动生成 ID。 */
+    public function save(?ClientInterface $client = null, array $options = []): static
+    {
+        $client ??= $this->resolveClient();
+        $params = array_replace($options, [
+            'index' => $this->getIndexName(),
+            'body' => $this->toDocument(),
+        ]);
+        if ($this->documentId !== null) {
+            $params['id'] = $this->documentId;
+        }
+        $raw = $client->responseToArray($client->index($params));
+        if (isset($raw['_id'])) {
+            $this->documentId = (string) $raw['_id'];
+        }
+        $this->exists = true;
+        return $this;
+    }
+
+    /** 按 ES 文档 ID 读取并 hydrate 模型，不存在时返回 null。 */
+    public static function find(string $id, ?ClientInterface $client = null): ?static
+    {
+        $model = new static();
+        $client ??= $model->resolveClient();
+        try {
+            $raw = $client->responseToArray($client->get([
+                'index' => $model->getIndexName(),
+                'id' => $id,
+            ]));
+        } catch (ResponseException $exception) {
+            if ($exception->statusCode() === 404) {
+                return null;
+            }
+            throw $exception;
+        }
+        if (($raw['found'] ?? true) === false) {
+            return null;
+        }
+        $model->documentId = isset($raw['_id']) ? (string) $raw['_id'] : $id;
+        $model->exists = true;
+        $model->fill((array) ($raw['_source'] ?? []));
+        return $model;
+    }
+
+    /** 更新属性并保存完整文档；Elasticsearch index 语义会覆盖当前文档。 */
+    public function update(array $attributes, ?ClientInterface $client = null, array $options = []): static
+    {
+        $this->fill($attributes);
+        return $this->save($client, $options);
+    }
+
+    /** 删除当前文档；未保存模型不能删除。 */
+    public function delete(?ClientInterface $client = null, array $options = []): bool
+    {
+        if ($this->documentId === null) {
+            throw new \LogicException('Cannot delete an Elasticsearch document without an ID.');
+        }
+        $client ??= $this->resolveClient();
+        $raw = $client->responseToArray($client->delete(array_replace($options, [
+            'index' => $this->getIndexName(),
+            'id' => $this->documentId,
+        ])));
+        $this->exists = false;
+        return ($raw['result'] ?? null) === 'deleted' || ($raw['deleted'] ?? false) === true;
+    }
+
     /** 子类可覆盖以声明索引 mapping。 */
     public function mapping(): array
     {
@@ -143,18 +229,18 @@ abstract class DocumentModel
     }
 
     /** 按具体模型类保存默认客户端，避免不同模型相互覆盖。 */
-    public static function setClient(ElasticsearchClient $client): void
+    public static function setClient(ClientInterface $client): void
     {
         self::$clients[static::class] = $client;
     }
 
     /** 创建绑定当前模型索引的 QueryBuilder；传入 client 可覆盖静态默认值。 */
-    public static function query(?ElasticsearchClient $client = null): QueryBuilder
+    public static function query(?ClientInterface $client = null): QueryBuilder
     {
         $model = new static();
         $client ??= self::$clients[static::class] ?? null;
         if ($client === null) {
-            $client = self::resolveClient($model->getConnectionName());
+            $client = self::resolveClientForConnection($model->getConnectionName());
         }
         if ($client === null) {
             throw new \LogicException('No Elasticsearch client has been configured for the model.');
@@ -166,7 +252,7 @@ abstract class DocumentModel
      * 从 Hyperf 当前应用容器解析连接客户端。
      * 该路径只在模型未显式传入客户端且未调用 setClient 时执行。
      */
-    private static function resolveClient(string $connection): ?ElasticsearchClient
+    private static function resolveClientForConnection(string $connection): ?ClientInterface
     {
         if (! ApplicationContext::hasContainer()) {
             return null;
@@ -178,6 +264,17 @@ abstract class DocumentModel
         }
 
         return $container->get(Manager::class)->connection($connection);
+    }
+
+    /** 解析当前模型声明的连接。 */
+    private function resolveClient(): ClientInterface
+    {
+        $client = self::$clients[static::class]
+            ?? self::resolveClientForConnection($this->getConnectionName());
+        if ($client === null) {
+            throw new \LogicException('No Elasticsearch client has been configured for the model.');
+        }
+        return $client;
     }
 
     /** 将 SearchHit 转换为已存在模型并复制 score/sort/highlight 元数据。 */

@@ -122,11 +122,15 @@ final class RequestBodyTest extends TestCase
 
     public function testOfficialResponseExceptionIsNormalized(): void
     {
-        $raw = new class {
+        $officialException = $this->officialResponseException(400);
+        $raw = new class($officialException) {
+            public function __construct(private \Throwable $exception)
+            {
+            }
+
             public function search(array $params): never
             {
-                $exception = new OfficialClientResponseException('bad request', 400);
-                throw $exception->setResponse(new Psr7Response(400, [], '{"error":"bad"}'));
+                throw $this->exception;
             }
         };
 
@@ -135,20 +139,92 @@ final class RequestBodyTest extends TestCase
             self::fail('Expected ResponseException was not thrown.');
         } catch (ResponseException $exception) {
             self::assertSame(400, $exception->statusCode());
-            self::assertInstanceOf(OfficialClientResponseException::class, $exception->getPrevious());
+            self::assertSame($officialException, $exception->getPrevious());
         }
     }
 
     public function testOfficialTransportExceptionIsNormalized(): void
     {
-        $raw = new class {
+        $raw = new class($this->officialTransportException()) {
+            public function __construct(private \Throwable $exception)
+            {
+            }
+
             public function search(array $params): never
             {
-                throw new \Elastic\Transport\Exception\NoNodeAvailableException('offline');
+                throw $this->exception;
             }
         };
 
         $this->expectException(TransportException::class);
         (new ElasticsearchClient($raw))->search(['index' => 'articles', 'body' => []]);
+    }
+
+    public function testTransportFailureResetsLazyClientForTheNextRequest(): void
+    {
+        $builds = 0;
+        $transportException = $this->officialTransportException();
+        $client = new ElasticsearchClient(function () use (&$builds, $transportException): object {
+            $builds++;
+            if ($builds === 1) {
+                return new class($transportException) {
+                    public function __construct(private \Throwable $exception)
+                    {
+                    }
+
+                    public function search(array $params): never
+                    {
+                        throw $this->exception;
+                    }
+                };
+            }
+
+            return new class {
+                public function search(array $params): array
+                {
+                    return ['hits' => ['total' => 0, 'hits' => []]];
+                }
+            };
+        });
+
+        try {
+            $client->search(['index' => 'articles', 'body' => []]);
+            self::fail('Expected the first request to fail.');
+        } catch (TransportException) {
+        }
+
+        self::assertSame(['hits' => ['total' => 0, 'hits' => []]], $client->responseToArray(
+            $client->search(['index' => 'articles', 'body' => []]),
+        ));
+        self::assertSame(2, $builds);
+    }
+
+    public function testResponseNormalizationWorksForArrayAndResponseObjects(): void
+    {
+        $client = new ElasticsearchClient(new \stdClass());
+        self::assertSame(['hits' => []], $client->responseToArray(['hits' => []]));
+        self::assertSame(['hits' => []], $client->responseToArray(new class {
+            public function asArray(): array { return ['hits' => []]; }
+        }));
+        self::assertTrue($client->responseToBool(new class {
+            public function asBool(): bool { return true; }
+        }));
+    }
+
+    private function officialResponseException(int $status): \Throwable
+    {
+        if (class_exists(OfficialClientResponseException::class)) {
+            return (new OfficialClientResponseException('bad request', $status))
+                ->setResponse(new Psr7Response($status, [], '{"error":"bad"}'));
+        }
+        return new \Elasticsearch\Common\Exceptions\BadRequest400Exception('bad request', $status);
+    }
+
+    private function officialTransportException(): \Throwable
+    {
+        if (class_exists('Elastic\\Transport\\Exception\\NoNodeAvailableException')) {
+            return new \Elastic\Transport\Exception\NoNodeAvailableException('offline');
+        }
+        return new \Elasticsearch\Common\Exceptions\NoNodesAvailableException('offline');
     }
 }

@@ -1,8 +1,9 @@
 # Sllhsmile Hyperf Elasticsearch
 
-当前稳定版本：`v0.0.2`
 
-面向 Hyperf 3.0+ 的 Elasticsearch 9 ORM 风格客户端。它在官方 `elasticsearch/elasticsearch:^9` 之上提供 Document Model、链式 Query Builder、Bulk、索引管理、PIT 和 Hyperf 官方协程 HTTP 接入。
+面向 Hyperf 3.0+ 的 Elasticsearch 7/8/9 ORM 风格客户端。它在官方客户端之上提供 Document Model、链式 Query Builder、Bulk、索引管理、PIT 和 Hyperf 协程 HTTP 接入。
+
+Model/QueryBuilder 是日常业务入口：模型负责索引、属性 casts 和文档生命周期，Builder 负责链式 DSL；底层 Client/Adapter 只负责官方客户端协议和版本差异。控制器不需要也不应该直接调用 `ElasticsearchClient` 完成常规 CRUD。
 
 它不是关系型数据库 ORM，也不负责 MySQL 到 Elasticsearch 的自动同步。复杂 DSL 始终可以通过 `rawDsl()` 直接传递。
 
@@ -12,10 +13,9 @@
 | --- | --- |
 | PHP | `>=8.1` |
 | Hyperf | `^3.0` |
-| Elasticsearch Server | 9.x（已按 9.6 API 设计） |
-| 官方 PHP Client | `elasticsearch/elasticsearch:^9` |
+| Elasticsearch Server | 7.17.x、8.x、9.x |
+| 官方 PHP Client | `elasticsearch/elasticsearch:^7.17`、`^8` 或 `^9`（只能安装一个主版本） |
 | Laravel | 当前版本不支持 |
-| Elasticsearch 7/8 | 预留，当前版本不支持 |
 | MySQL 自动同步 | 不支持 |
 
 ## 使用文档
@@ -30,6 +30,14 @@
 ```bash
 composer require sllhsmile/hyperf-elasticsearch
 ```
+
+默认会由 Composer 选择与 Hyperf 匹配的官方客户端；需要指定服务端主版本时可在宿主显式约束。例如 ES8：
+
+```bash
+composer require elasticsearch/elasticsearch:^8
+```
+
+ES7.17 或 ES9 分别使用 `^7.17`、`^9`，同一运行实例只会安装一个主版本。Hyperf 3.0/3.1 对应 ES7，Hyperf 3.2 对应 ES8/9。
 
 如果项目此前使用旧包名 `sllhsmile/elasticsearch`，请先移除旧依赖再安装新包名：
 
@@ -57,7 +65,7 @@ ELASTICSEARCH_RETRIES=2
 ELASTICSEARCH_VERIFY_TLS=true
 ```
 
-Handler 无需配置。包通过官方 `Hyperf\\Elasticsearch\\ClientBuilderFactory` 自动选择协程 Handler 或 cURL 路径。连接配置支持 hosts、认证、retries、TLS 和自定义 headers。
+包直接复用 `hyperf/elasticsearch` 的版本适配：Hyperf 3.0/3.1 使用 ES7 与 RingPHP 协程 Handler，Hyperf 3.2 使用 ES8/9 与 Hyperf Guzzle。Composer 会依据宿主 Hyperf 和官方客户端约束选择匹配版本。连接配置支持 hosts、认证、超时、retries、TLS 和自定义 headers。
 
 不要把 ApiKey 写入 PHP 文件、Git、日志或异常信息。真实云端凭据必须通过未提交的环境变量注入。
 
@@ -72,9 +80,11 @@ Handler 无需配置。包通过官方 `Hyperf\\Elasticsearch\\ClientBuilderFact
 | `default` | 顶层 | 未指定连接名时使用的连接名称 | `default` |
 | `connections` | 顶层 | 定义一个或多个命名连接 | 至少包含被使用的连接 |
 | `hosts` | 连接内 | Elasticsearch 节点 URL 列表 | `http://127.0.0.1:9200` |
-| `api_key` | 连接内 | API Key 认证 | 空；不能与 Basic Auth 同时配置 |
+| `api_key` | 连接内 | API Key 认证 | 空；填写 Elasticsearch 返回的 base64 encoded key，不能与 Basic Auth 同时配置 |
 | `username` | 连接内 | Basic Auth 用户名 | 空；配置后必须同时配置 `password` |
 | `password` | 连接内 | Basic Auth 密码 | 空；配置后必须同时配置 `username`，请使用环境变量 |
+| `timeout` | 连接内 | 请求超时秒数 | `10` |
+| `connect_timeout` | 连接内 | 建立连接超时秒数 | `5` |
 | `retries` | 连接内 | 节点请求失败后的重试次数 | `1`；`0` 表示不重试 |
 | `verify_tls` | 连接内 | HTTPS 证书校验；可填布尔值或 CA 文件路径 | `true` |
 | `headers` | 连接内 | 追加到每个 ES 请求的自定义 Header | `[]` |
@@ -101,9 +111,11 @@ return [
 ];
 ```
 
-`handler`、连接池和 `client_options` 不属于当前发布配置。HTTP 客户端由 Hyperf
-官方 `ClientBuilderFactory` 管理，并在协程环境中自动使用协程 Handler；不要在业务代码
-中自行设置 Handler 或为每次查询创建客户端。
+`handler` 和连接池不属于业务配置。HTTP 客户端由 Hyperf Guzzle 工厂管理，并在协程环境中自动使用协程 Handler；不要在业务代码中自行设置 Handler 或为每次查询创建客户端。
+
+网络超时等传输故障会让官方单节点池暂时标记节点不可用；包会在异常后清理失效客户端，
+下一次请求自动重建连接，不需要重启 Hyperf Worker。失败请求不会被包自动重放，写入接口请
+结合业务幂等 ID 使用。
 
 ## 快速开始
 
@@ -130,6 +142,21 @@ foreach ($response as $article) {
 }
 ```
 
+文档生命周期同样使用模型 API：
+
+```php
+$article = Article::create(['title' => 'PHP', 'views' => '10'], 'article-1');
+$article->fill(['views' => 11])->setKey('article-1')->save();
+$article->update(['views' => 12]);
+$article->delete();
+
+$article = Article::find('article-1'); // 404 时返回 null
+```
+
+`create()`、`save()`、`update()` 返回 hydrate 后的模型，`toArray()` 会按 casts 输出；
+`exists()` 表示模型是否已由 ES 写入或命中。需要绕过 ORM 使用未封装 endpoint 时，才使用
+`Manager::connection()` 返回的底层 Client。
+
 ## 功能总览
 
 | 功能 | 入口 | 教程 |
@@ -144,7 +171,8 @@ foreach ($response as $article) {
 | Highlight/Aggregation | `highlight`、`aggs` | [查询选项](https://github.com/sllhSmile/hyperf-elasticsearch/blob/main/USAGE.md#7-排序分页高亮聚合和-raw-dsl) |
 | 原始 DSL | `rawDsl`、`replaceDsl` | [原始 DSL](https://github.com/sllhSmile/hyperf-elasticsearch/blob/main/USAGE.md#7-排序分页高亮聚合和-raw-dsl) |
 | 深分页/PIT | `searchAfter`、`pit`、`PitManager` | [深分页](https://github.com/sllhSmile/hyperf-elasticsearch/blob/main/USAGE.md#8-深分页与-pit) |
-| 写入 | `index`、`create`、`update`、`delete` | [文档写入](https://github.com/sllhSmile/hyperf-elasticsearch/blob/main/USAGE.md#9-单文档写入) |
+| ORM 文档写入 | `Model::create`、`save`、`find`、`update`、`delete` | [模型写入](https://github.com/sllhSmile/hyperf-elasticsearch/blob/main/USAGE.md#41-文档模型写入读取更新和删除) |
+| 底层文档写入 | `index`、`create`、`update`、`delete` | [底层写入](https://github.com/sllhSmile/hyperf-elasticsearch/blob/main/USAGE.md#9-单文档写入) |
 | Bulk | `BulkOperation`、`BulkManager` | [Bulk](https://github.com/sllhSmile/hyperf-elasticsearch/blob/main/USAGE.md#10-bulk-批量操作) |
 | 索引管理 | `IndexManager` | [索引管理](https://github.com/sllhSmile/hyperf-elasticsearch/blob/main/USAGE.md#11-索引与-alias-管理) |
 | 响应对象 | `SearchResponse`、`SearchHit` | [响应处理](https://github.com/sllhSmile/hyperf-elasticsearch/blob/main/USAGE.md#12-响应与异常) |

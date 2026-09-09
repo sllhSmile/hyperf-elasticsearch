@@ -13,12 +13,16 @@ return [
             // Elasticsearch 节点地址列表。支持一个或多个 http/https URL；
             // 多节点时官方客户端会按节点池策略选择可用节点。
             'hosts' => [env('ELASTICSEARCH_HOST', 'http://127.0.0.1:9200')],
-            // API Key 认证值。与 username/password 互斥，建议仅通过环境变量注入。
+            // API Key 认证值，填写 Elasticsearch 返回的 base64 encoded key。
+            // 与 username/password 互斥，建议仅通过环境变量注入。
             'api_key' => env('ELASTICSEARCH_API_KEY'),
             // Basic Authentication 用户名；必须与 password 一起配置。
             'username' => env('ELASTICSEARCH_USERNAME'),
             // Basic Authentication 密码；不要提交到代码仓库或日志。
             'password' => env('ELASTICSEARCH_PASSWORD'),
+            // 单次请求与建立连接超时（秒），会传入 Hyperf Guzzle。
+            'timeout' => (int) env('ELASTICSEARCH_TIMEOUT', 10),
+            'connect_timeout' => (int) env('ELASTICSEARCH_CONNECT_TIMEOUT', 5),
             // 官方客户端在节点失败时的重试次数。0 表示不重试。
             'retries' => (int) env('ELASTICSEARCH_RETRIES', 1),
             // TLS 证书校验：true 启用校验，false 禁用校验（仅限受控测试环境），

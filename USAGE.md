@@ -1,6 +1,6 @@
 # 使用文档
 
-本文以 Hyperf 3.0+ 和 Elasticsearch 9.x 为目标，示例均假定已在容器中取得 `Manager`。除特别说明外，调用链上的方法只是在内存中累积 DSL，`search`、`index`、`create`、`update`、`delete`、Bulk、索引和 PIT 方法才会发起网络请求。
+本文以 Hyperf 3.0+ 和 Elasticsearch 7.17/8/9 为目标，示例均假定已在容器中取得 `Manager`。除特别说明外，调用链上的方法只是在内存中累积 DSL，`search`、`index`、`create`、`update`、`delete`、Bulk、索引和 PIT 方法才会发起网络请求。
 
 ## 1. 安装与配置
 
@@ -18,7 +18,7 @@ ELASTICSEARCH_RETRIES=2
 ELASTICSEARCH_VERIFY_TLS=true
 ```
 
-不要把密钥提交到 Git 或打印到日志。Handler 无需配置，包使用官方 `Hyperf\\Elasticsearch\\ClientBuilderFactory` 自动选择协程 HTTP Handler；这与 Hyperf 官方 Elasticsearch 客户端的行为一致。HTTP timeout/client_options 不在官方工厂配置范围内，包不会通过 `setHttpClientOptions()` 重建客户端；如需调整请在 Hyperf 全局 Guzzle/Swoole 配置中处理。
+不要把密钥提交到 Git 或打印到日志。`api_key` 填写 Elasticsearch 创建 API Key 响应中的 base64 `encoded` 值。依赖组合为 Hyperf/`hyperf-elasticsearch` 3.0 或 3.1 + ES7，或 Hyperf/`hyperf-elasticsearch` 3.2 + ES8/9；宿主可显式约束 `elasticsearch/elasticsearch:^7.17`、`^8` 或 `^9`。包复用对应版本的官方 Hyperf 工厂；ES8/9 的 `timeout`、`connect_timeout`、TLS 和 `client_options` 会在创建协程 Guzzle client 时一次性注入。
 
 ## 2. 客户端与连接管理
 
@@ -31,6 +31,11 @@ $manager->purge();                                // 丢弃全部客户端
 ```
 
 `connection(?string $name): ElasticsearchClient` 按名称懒加载并缓存客户端；配置不存在时抛出 `InvalidArgumentException`。`purge` 不访问网络，只清理 Worker 内的客户端引用。多个连接互相隔离，适合不同集群或凭据。
+
+官方客户端的节点池可能在连接超时后把唯一节点标记为 dead。包在捕获传输层异常时会自动
+丢弃当前客户端，下一次请求重新创建 client/node pool，因此不需要重启整个 Hyperf Worker。
+失败请求本身不会被包自动重放，尤其是写入请求，避免网络超时但服务端已成功处理时造成重复写入。
+压测仍应保证 ES 集群、出口网络和连接/请求超时足够，并配置多个 hosts 以减少单节点故障影响。
 
 ## 3. 协程 HTTP
 
@@ -78,6 +83,75 @@ Article::query();                            // 按模型 connection 自动解�
 ```
 
 `getIndexName(): string` 返回索引名；未定义索引时抛出 `LogicException`。`getKey`、`exists`、`getScore`、`getSortValues`、`getHighlight` 分别读取 `_id`、命中状态、相关性分数、排序值和高亮结果。`fromSearchHit(SearchHit $hit): static` 会把 `_source` 和 hit 元数据转换为已存在模型。支持 `int`、`float`、`bool`、`array/json`、`datetime` casts。
+
+### 4.1 文档模型写入、读取、更新和删除
+
+`DocumentModel` 是包的 ORM 风格核心入口，负责索引绑定、属性 casts 和文档生命周期；底层
+`ClientInterface`/官方客户端只负责传输协议，不应在控制器中绕过模型直接拼接请求。
+
+```php
+$article = Article::create([
+    'title' => 'Hyperf Elasticsearch',
+    'views' => '10',
+    'published_at' => '2026-09-07T12:00:00+08:00',
+], 'article-1');
+
+$article->fill(['views' => 11])->setKey('article-1')->save();
+$article->update(['views' => 12]);
+$article->delete();
+
+$article = Article::find('article-1'); // 不存在时返回 null
+```
+
+`create()` 和 `save()` 返回已经 hydrate 的模型，并将服务端返回的 `_id` 写回模型。已有 ID
+的 `save()` 使用 `index` 覆盖写入；没有 ID 时由 Elasticsearch 生成 ID。`update()` 是填充属性后
+再次保存完整文档的便捷方法，不模拟关系型数据库事务。`delete()` 成功后将 `exists()` 设为
+`false`。`find()` 会把 `_source` hydrate 到模型并执行入站 casts；HTTP 404 会转换为 `null`，
+其他服务端错误仍抛出 `ResponseException`。
+
+### 4.2 QueryBuilder 写入和链式查询
+
+模型 QueryBuilder 与模型静态 API 使用同一个连接和 adapter：
+
+```php
+$article = Article::query()->create(['title' => 'PHP', 'views' => 10], 'article-2');
+
+$response = Article::query()
+    ->where('title', 'PHP')
+    ->whereMatch('content', 'Elasticsearch')
+    ->whereRange('score', ['gte' => 1])
+    ->orderBy('created_at', 'desc')
+    ->size(20)
+    ->search();
+
+foreach ($response->hits() as $article) {
+    echo $article->getKey();
+}
+```
+
+`size()` 只限制当前页命中数，`SearchResponse::total()` 是 Elasticsearch 的匹配总数，
+`count($response)` 是当前页数量。深分页使用 `searchAfter()`/PIT；不要把 `from`/`size` 当作
+无限分页方案。
+
+### 4.3 Hyperf 测试控制器接口
+
+宿主示例 `IndexController` 仅用于开发验证，控制器内部只调用模型和 QueryBuilder：
+
+```bash
+curl -X POST http://127.0.0.1:9501/elasticsearch/test/write \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"test-1","title":"Hyperf Elasticsearch","score":10,"created_at":"2026-09-07T12:00:00+08:00"}'
+
+curl 'http://127.0.0.1:9501/elasticsearch/test/read?id=test-1'
+curl 'http://127.0.0.1:9501/elasticsearch/test/search?keyword=Hyperf&min_score=1&size=20'
+```
+
+写入接口使用 `query()->create(..., ['refresh' => 'wait_for'])`，返回文档 ID、casts 后的
+文档和 `exists=true`。读取接口使用 `Model::find()`，模型不存在时返回业务 HTTP 404；
+搜索接口默认按 `created_at desc` 排序，`size` 最大为 100，返回 `total`、当前页 `count`、
+hydrate 后的 `models` 和 `aggregations`。传入 `debug=1` 时才额外返回完整原始响应 `raw`，
+便于开发排查 DSL 和 Elasticsearch 元数据；生产环境不要开启该参数。
+搜索接口不读取 `id` 参数；按 ID 读取请调用 `/elasticsearch/test/read?id=...`。
 
 ## 5. QueryBuilder 基础条件
 
@@ -128,7 +202,7 @@ $response = Article::query()
 即使 `$options` 中包含 `order`，也不会覆盖已经校验的 `$direction`；其他排序选项如
 `mode`、`missing` 会原样保留。
 
-`toDsl(): array` 只编译，不访问网络；`replaceDsl` 会替换全部 raw DSL，`rawDsl` 则递归合并。`search(): SearchResponse` 将 DSL 放在 ES9 `body` 中；`get()` 是别名，`first()` 自动 `size(1)`，`count()` 自动 `size(0)` 并返回 `hits.total`。
+`toDsl(): array` 只编译，不访问网络；`replaceDsl` 会替换全部 raw DSL，`rawDsl` 递归合并但不允许覆盖链式 API 已生成的顶层键。需要完全覆盖时使用 `replaceDsl()`。`search(): SearchResponse` 将 DSL 放在各版本通用的 `body` 中；`get()` 是别名，`first()` 自动使用独立查询副本设置 `size(1)`，`count()` 自动使用独立查询副本设置 `size(0)` 并返回 `hits.total`。
 
 ## 8. 深分页与 PIT
 
@@ -150,6 +224,10 @@ $client->pitManager()->using('articles', fn (string $id) => Article::query()->pi
 
 ## 9. 单文档写入
 
+本节以下入口是需要访问未封装官方 endpoint 时使用的底层 Client API。业务控制器的常规写入
+优先使用上一节的 `Model::create()`、`save()`、`update()` 和 `delete()`，这样可以保留模型
+casts、索引绑定和统一异常行为。
+
 ```php
 $client->index(['index' => 'articles', 'id' => 'a-1', 'body' => ['title' => 'Hello']]);
 $client->create(['index' => 'articles', 'id' => 'a-2', 'body' => ['title' => 'New']]);
@@ -157,7 +235,7 @@ $client->update(['index' => 'articles', 'id' => 'a-1', 'body' => ['doc' => ['vie
 $client->delete(['index' => 'articles', 'id' => 'a-2']);
 ```
 
-这些方法是官方 ES9 endpoint 的轻量转发，参数中的文档内容必须放 `body`；冲突、未找到或权限错误会由适配器统一转换为本包的 `ResponseException` 或 `TransportException`。
+这些方法是官方 ES7/8/9 endpoint 的轻量转发，参数中的文档内容必须放 `body`；冲突、未找到或权限错误会由适配器统一转换为本包的 `ResponseException` 或 `TransportException`。
 
 ## 10. Bulk 批量操作
 

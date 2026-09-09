@@ -4,9 +4,9 @@ declare(strict_types=1);
 
 namespace SllhSmile\Elasticsearch\Builder;
 
-use Closure;
-use SllhSmile\Elasticsearch\Client\ElasticsearchClient;
 use SllhSmile\Elasticsearch\Contract\BuilderInterface;
+use SllhSmile\Elasticsearch\Contract\ClientInterface;
+use SllhSmile\Elasticsearch\Model\DocumentModel;
 use SllhSmile\Elasticsearch\Response\SearchResponse;
 
 /**
@@ -23,7 +23,7 @@ final class QueryBuilder implements BuilderInterface
     private ?array $rawDsl = null;
 
     /** 绑定客户端、模型类和索引名；构造过程不访问网络。 */
-    public function __construct(private readonly ElasticsearchClient $client, private readonly string $modelClass, private readonly string $index)
+    public function __construct(private readonly ClientInterface $client, private readonly string $modelClass, private readonly string $index)
     {
     }
 
@@ -83,6 +83,9 @@ final class QueryBuilder implements BuilderInterface
     /** 用 gte/lte 添加闭区间 range filter。 */
     public function whereBetween(string $field, array $range): self
     {
+        if (count($range) !== 2) {
+            throw new \InvalidArgumentException('whereBetween requires exactly two boundary values.');
+        }
         [$from, $to] = array_pad(array_values($range), 2, null);
         $this->filter[] = ['range' => [$field => ['gte' => $from, 'lte' => $to]]];
         return $this;
@@ -185,14 +188,20 @@ final class QueryBuilder implements BuilderInterface
     /** 设置浅分页起始偏移。 */
     public function from(int $from): self
     {
-        $this->body['from'] = max(0, $from);
+        if ($from < 0) {
+            throw new \InvalidArgumentException('from cannot be negative.');
+        }
+        $this->body['from'] = $from;
         return $this;
     }
 
     /** 设置返回条数。 */
     public function size(int $size): self
     {
-        $this->body['size'] = max(0, $size);
+        if ($size < 0) {
+            throw new \InvalidArgumentException('size cannot be negative.');
+        }
+        $this->body['size'] = $size;
         return $this;
     }
 
@@ -240,7 +249,11 @@ final class QueryBuilder implements BuilderInterface
     /** 递归合并一段原始 DSL。 */
     public function rawDsl(array $dsl): self
     {
-        $this->rawDsl = array_replace_recursive($this->rawDsl ?? [], $dsl);
+        if ($this->rawDsl === null) {
+            $this->rawDsl = $dsl;
+            return $this;
+        }
+        $this->rawDsl = array_replace_recursive($this->rawDsl, $dsl);
         return $this;
     }
 
@@ -259,16 +272,21 @@ final class QueryBuilder implements BuilderInterface
             $compiled['query'] = $this->compileQuery();
         }
         if ($this->rawDsl !== null) {
+            foreach (array_intersect_key($compiled, $this->rawDsl) as $key => $value) {
+                if ($this->rawDsl[$key] !== $value) {
+                    throw new \InvalidArgumentException("rawDsl conflicts with generated DSL key [{$key}]; use replaceDsl() to replace the complete DSL.");
+                }
+            }
             $compiled = array_replace_recursive($compiled, $this->rawDsl);
         }
         return $compiled;
     }
 
-    /** 将 DSL 放入 ES9 body 发起搜索并解析为 SearchResponse。 */
+    /** 将 DSL 放入各版本通用 body 发起搜索并解析为 SearchResponse。 */
     public function search(): SearchResponse
     {
         $response = $this->client->search(['index' => $this->index, 'body' => $this->toDsl()]);
-        $raw = is_object($response) && method_exists($response, 'asArray') ? $response->asArray() : (is_object($response) && method_exists($response, 'toArray') ? $response->toArray() : (array) $response);
+        $raw = $this->client->responseToArray($response);
         return new SearchResponse($raw, $this->modelClass);
     }
 
@@ -278,16 +296,38 @@ final class QueryBuilder implements BuilderInterface
         return $this->search();
     }
 
+    /** 通过模型 QueryBuilder 创建并写入文档。 */
+    public function create(array $attributes, ?string $id = null, array $options = []): DocumentModel
+    {
+        if (! is_a($this->modelClass, DocumentModel::class, true)) {
+            throw new \LogicException('QueryBuilder model class must extend DocumentModel.');
+        }
+        /** @var DocumentModel $model */
+        $model = new $this->modelClass($attributes);
+        if ($id !== null) {
+            $model->setKey($id);
+        }
+        return $model->save($this->client, $options);
+    }
+
+    /** create 的语义别名，适合显式表达写入动作。 */
+    public function insert(array $attributes, ?string $id = null, array $options = []): DocumentModel
+    {
+        return $this->create($attributes, $id, $options);
+    }
+
     /** 设置 size=1 搜索并返回首条命中。 */
     public function first(): ?object
     {
-        return $this->size(1)->search()->first();
+        $query = clone $this;
+        return $query->size(1)->search()->first();
     }
 
     /** 设置 size=0/track_total_hits 并返回匹配总数。 */
     public function count(): int
     {
-        return $this->trackTotalHits(true)->size(0)->search()->total();
+        $query = clone $this;
+        return $query->trackTotalHits(true)->size(0)->search()->total();
     }
 
     /** 将 bool 条件包装为 query.bool 节点。 */
