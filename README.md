@@ -21,7 +21,6 @@ Model/QueryBuilder 是日常业务入口：模型负责索引、属性 casts 和
 ## 使用文档
 
 - [完整使用文档](https://github.com/sllhSmile/hyperf-elasticsearch/blob/main/USAGE.md)：每项公开功能的安装、配置、调用和注意事项。
-- [设计文档](https://github.com/sllhSmile/hyperf-elasticsearch/blob/main/DESIGN.md)：记录分阶段方案、实现流程和版本进度，面向开发维护，不作为 Composer 用户文档发布。
 
 发布说明：GitHub 保留 README 和 USAGE；Composer dist 按发布规则仅保留 README，USAGE 通过上方 GitHub 链接访问。
 
