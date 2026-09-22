@@ -19,6 +19,7 @@ use Throwable;
  */
 class OfficialClientAdapter implements ClientAdapterInterface
 {
+    /** 保存官方客户端及其主版本，供统一 endpoint 分派和能力声明使用。 */
     public function __construct(
         private readonly object $client,
         private readonly int $clientMajor = ClientMajor::ES9,
@@ -26,6 +27,7 @@ class OfficialClientAdapter implements ClientAdapterInterface
     {
     }
 
+    /** 将稳定 operation 名映射到不同版本官方客户端共有的 endpoint。 */
     public function call(string $operation, array $params = []): mixed
     {
         return match ($operation) {
@@ -51,6 +53,7 @@ class OfficialClientAdapter implements ClientAdapterInterface
         };
     }
 
+    /** 将 ES7 数组或 ES8/9 响应对象统一转换为数组。 */
     public function responseToArray(mixed $response): array
     {
         if (is_array($response)) {
@@ -66,6 +69,7 @@ class OfficialClientAdapter implements ClientAdapterInterface
         return (array) $response;
     }
 
+    /** 将各版本 exists 响应统一转换为布尔值。 */
     public function responseToBool(mixed $response): bool
     {
         if (is_bool($response)) {
@@ -77,17 +81,20 @@ class OfficialClientAdapter implements ClientAdapterInterface
         return (bool) $response;
     }
 
+    /** 返回与当前官方客户端主版本关联的协议能力。 */
     public function capabilities(): ClientCapabilities
     {
         return new ClientCapabilities($this->clientMajor);
     }
 
+    /** 将官方客户端和 PSR 传输异常归一化为包内稳定异常类型。 */
     public function normalizeException(Throwable $exception): Throwable
     {
         if ($exception instanceof ElasticsearchException) {
             return $exception;
         }
 
+        // 先识别无可用节点、DNS 和 HTTP 传输故障，避免误归类为服务端响应错误。
         $transportClasses = $this->availableClasses([
             'Elastic\\Transport\\Exception\\TransportException',
             'Elastic\\Transport\\Exception\\NoNodeAvailableException',
@@ -102,6 +109,7 @@ class OfficialClientAdapter implements ClientAdapterInterface
             return new TransportException($exception->getMessage(), (int) $exception->getCode(), $exception);
         }
 
+        // 官方 7/8/9 的响应异常命名不同，但都保留状态码和原始响应供业务判断。
         $responseClasses = $this->availableClasses([
             'Elastic\\Elasticsearch\\Exception\\ClientResponseException',
             'Elastic\\Elasticsearch\\Exception\\ServerResponseException',
@@ -133,12 +141,19 @@ class OfficialClientAdapter implements ClientAdapterInterface
         return new ElasticsearchException($exception->getMessage(), (int) $exception->getCode(), $exception);
     }
 
+    /** 返回底层官方客户端，供尚未封装的 endpoint 使用。 */
     public function raw(): object
     {
         return $this->client;
     }
 
-    /** @param list<string> $classes @return list<string> */
+    /**
+     * 过滤当前依赖版本中实际存在的异常类型，避免跨版本 instanceof 触发无效引用。
+     *
+     * @param list<string> $classes
+     *
+     * @return list<string>
+     */
     private function availableClasses(array $classes): array
     {
         return array_values(array_filter(

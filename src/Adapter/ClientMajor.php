@@ -16,6 +16,7 @@ final class ClientMajor
     /** @var list<int> */
     public const SUPPORTED = [self::ES7, self::ES8, self::ES9];
 
+    /** 常量容器不允许实例化。 */
     private function __construct()
     {
     }

@@ -8,9 +8,10 @@ use Countable;
 use IteratorAggregate;
 use Traversable;
 
-/** @implements IteratorAggregate<int, object> */
 /**
  * 搜索结果集合，提供命中迭代、总数、聚合和原始响应访问。
+ *
+ * @implements IteratorAggregate<int, object>
  */
 final class SearchResponse implements Countable, IteratorAggregate
 {
@@ -28,8 +29,11 @@ final class SearchResponse implements Countable, IteratorAggregate
         }
     }
 
-    /** @return list<object> */
-    /** 返回已转换为 SearchHit 或模型实例的命中列表。 */
+    /**
+     * 返回已转换为 SearchHit 或模型实例的命中列表。
+     *
+     * @return list<object>
+     */
     public function hits(): array
     {
         return $this->hitObjects;

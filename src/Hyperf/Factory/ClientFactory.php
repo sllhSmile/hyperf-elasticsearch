@@ -18,6 +18,7 @@ use SllhSmile\Elasticsearch\Exception\ConfigurationException;
 /** 通过匹配当前 Hyperf 版本的官方工厂创建 ES7/8/9 客户端。 */
 final class ClientFactory
 {
+    /** 保存 Hyperf 容器；真正创建客户端时才解析版本对应的工厂。 */
     public function __construct(private readonly ?ContainerInterface $container = null)
     {
     }
@@ -28,6 +29,7 @@ final class ClientFactory
         return new ElasticsearchClient(fn (): object => $this->build($config));
     }
 
+    /** 创建官方客户端并按 ES7 与 ES8/9 的不同 HTTP 栈应用连接配置。 */
     private function build(ConnectionConfig $config): object
     {
         $major = AdapterFactory::detectMajor();
@@ -35,6 +37,7 @@ final class ClientFactory
         $builder->setHosts($config->hosts);
         $builder->setRetries($config->retries);
 
+        // ES7 使用 RingPHP 配置入口，ES8/9 使用 PSR-18 Guzzle 客户端，不能混用参数位置。
         if ($major === ClientMajor::ES7) {
             $this->configureElastic7($builder, $config);
         } else {
@@ -42,6 +45,7 @@ final class ClientFactory
         }
 
         $client = $builder->build();
+        // ES8/9 的自定义 Header 还需写入 Transport，确保客户端构造后的请求持续携带。
         if ($major !== ClientMajor::ES7) {
             $transport = $client->getTransport();
             foreach ($config->headers as $name => $value) {
@@ -53,6 +57,7 @@ final class ClientFactory
         return $client;
     }
 
+    /** 从容器解析 Hyperf 官方 ClientBuilderFactory，并将绑定错误转换为配置异常。 */
     private function resolveBuilderFactory(): ClientBuilderFactory
     {
         if ($this->container === null) {
@@ -126,6 +131,7 @@ final class ClientFactory
         }
     }
 
+    /** 从容器解析 ES8/9 使用的 Hyperf Guzzle 工厂。 */
     private function resolveGuzzleFactory(): GuzzleClientFactory
     {
         if ($this->container === null || ! $this->container->has(GuzzleClientFactory::class)) {
@@ -138,7 +144,11 @@ final class ClientFactory
         return $factory;
     }
 
-    /** @return array<string, list<string>> */
+    /**
+     * 将 ES7 Header 标量规范化为 RingPHP 接受的字符串列表，忽略非法键值。
+     *
+     * @return array<string, list<string>>
+     */
     private function normalizeElastic7Headers(array $headers): array
     {
         $normalized = [];

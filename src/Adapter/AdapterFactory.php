@@ -10,6 +10,7 @@ use SllhSmile\Elasticsearch\Exception\ConfigurationException;
 /** 根据已安装官方客户端主版本创建对应 adapter。 */
 final class AdapterFactory
 {
+    /** 按显式或自动检测的主版本包装官方客户端，拒绝不支持的版本。 */
     public static function fromClient(object $client, ?int $major = null): OfficialClientAdapter
     {
         $major ??= self::detectMajor();
@@ -21,6 +22,7 @@ final class AdapterFactory
         };
     }
 
+    /** 优先读取 Composer 版本元数据，缺失时再根据官方客户端类名推断主版本。 */
     public static function detectMajor(): int
     {
         if (class_exists(InstalledVersions::class) && InstalledVersions::isInstalled('elasticsearch/elasticsearch')) {
@@ -34,6 +36,7 @@ final class AdapterFactory
             }
         }
 
+        // 类名回退只能区分 ES7 与新版命名空间；正常 Composer 安装会在上方得到精确版本。
         if (class_exists('Elasticsearch\\ClientBuilder')) {
             return ClientMajor::ES7;
         }

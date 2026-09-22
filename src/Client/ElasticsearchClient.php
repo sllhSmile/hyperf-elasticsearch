@@ -22,7 +22,11 @@ final class ElasticsearchClient implements ClientInterface
 
     private ?ClientAdapterInterface $adapter = null;
 
-    /** @param object $client 官方客户端实例、adapter 或延迟创建 Closure。 */
+    /**
+     * 保存官方客户端、adapter 或延迟创建 Closure；构造阶段不会访问网络。
+     *
+     * @param object $client
+     */
     public function __construct(object $client)
     {
         $this->client = $client;
@@ -57,26 +61,31 @@ final class ElasticsearchClient implements ClientInterface
         $this->adapter = null;
     }
 
+    /** 按路径分派 GET 请求到本包支持的官方 endpoint。 */
     public function requestGet(string $path, array $query = [], array $options = []): mixed
     {
         return $this->dispatch('GET', $path, $query, null, $options);
     }
 
+    /** 按路径分派 POST 请求，并将可选 body 传给官方 endpoint。 */
     public function requestPost(string $path, array $query = [], ?array $body = null, array $options = []): mixed
     {
         return $this->dispatch('POST', $path, $query, $body, $options);
     }
 
+    /** 按路径分派 PUT 请求，并将可选 body 传给官方 endpoint。 */
     public function requestPut(string $path, array $query = [], ?array $body = null, array $options = []): mixed
     {
         return $this->dispatch('PUT', $path, $query, $body, $options);
     }
 
+    /** 按路径分派 DELETE 请求，并将可选 body 传给官方 endpoint。 */
     public function requestDelete(string $path, array $query = [], ?array $body = null, array $options = []): mixed
     {
         return $this->dispatch('DELETE', $path, $query, $body, $options);
     }
 
+    /** 返回延迟解析后的官方客户端实例。 */
     public function raw(): object
     {
         return $this->adapter()->raw();
@@ -88,34 +97,58 @@ final class ElasticsearchClient implements ClientInterface
         return $this->raw()->indices();
     }
 
+    /** 返回当前官方客户端主版本和协议能力。 */
     public function capabilities(): ClientCapabilities
     {
         return $this->adapter()->capabilities();
     }
 
+    /** 将官方数组或响应对象转换为统一数组。 */
     public function responseToArray(mixed $response): array
     {
         return $this->adapter()->responseToArray($response);
     }
 
+    /** 将官方 exists 等响应转换为统一布尔值。 */
     public function responseToBool(mixed $response): bool
     {
         return $this->adapter()->responseToBool($response);
     }
 
+    /** 调用集群 info endpoint。 */
     public function info(array $params = []): mixed { return $this->call('info', $params); }
+
+    /** 调用 search endpoint。 */
     public function search(array $params): mixed { return $this->call('search', $params); }
+
+    /** 调用文档 get endpoint。 */
     public function get(array $params): mixed { return $this->call('get', $params); }
+
+    /** 调用文档 index endpoint。 */
     public function index(array $params): mixed { return $this->call('index', $params); }
+
+    /** 调用文档 create endpoint。 */
     public function create(array $params): mixed { return $this->call('create', $params); }
+
+    /** 调用文档 update endpoint。 */
     public function update(array $params): mixed { return $this->call('update', $params); }
+
+    /** 调用文档 delete endpoint。 */
     public function delete(array $params): mixed { return $this->call('delete', $params); }
+
+    /** 调用 bulk endpoint。 */
     public function bulk(array $params): mixed { return $this->call('bulk', $params); }
 
+    /** 创建复用当前客户端的索引管理器。 */
     public function indexManager(): IndexManager { return new IndexManager($this); }
+
+    /** 创建复用当前客户端并使用指定分块大小的 Bulk 管理器。 */
     public function bulkManager(int $chunkSize = 500): BulkManager { return new BulkManager($this, $chunkSize); }
+
+    /** 创建复用当前客户端的 PIT 生命周期管理器。 */
     public function pitManager(): PitManager { return new PitManager($this); }
 
+    /** 首次使用时解析延迟工厂，并缓存与官方客户端版本匹配的 adapter。 */
     private function adapter(): ClientAdapterInterface
     {
         if ($this->adapter !== null) {
@@ -131,6 +164,7 @@ final class ElasticsearchClient implements ClientInterface
         return $this->adapter = AdapterFactory::fromClient($client);
     }
 
+    /** 归一化异常；传输故障会清除 adapter，使下一次请求重建官方节点池。 */
     private function normalizeException(Throwable $exception): Throwable
     {
         $normalized = $this->adapter()->normalizeException($exception);
@@ -140,6 +174,7 @@ final class ElasticsearchClient implements ClientInterface
         return $normalized;
     }
 
+    /** 将有限的 REST 路径集合映射为稳定 operation，不提供任意 HTTP 传输。 */
     private function dispatch(string $method, string $path, array $query, ?array $body, array $options): mixed
     {
         $method = strtoupper($method);
@@ -148,6 +183,7 @@ final class ElasticsearchClient implements ClientInterface
         if ($body !== null) {
             $params['body'] = $body;
         }
+        // 根路径、搜索、mapping、索引、Bulk 和文档路由按顺序匹配，未声明路由明确拒绝。
         if ($normalized === '/') {
             if ($method !== 'GET') {
                 throw new \BadMethodCallException("Unsupported Elasticsearch request method [{$method} {$path}].");
