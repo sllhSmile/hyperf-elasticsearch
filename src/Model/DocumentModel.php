@@ -32,6 +32,9 @@ abstract class DocumentModel
     /** @var array<string, mixed> */
     protected array $attributes = [];
 
+    /** @var array<string, mixed> 成功读取或写入时的文档快照，用于只提交改动字段。 */
+    protected array $original = [];
+
     protected bool $exists = false;
 
     protected ?string $documentId = null;
@@ -69,13 +72,6 @@ abstract class DocumentModel
     public function getKey(): ?string
     {
         return $this->documentId;
-    }
-
-    /** 设置 Elasticsearch 文档 ID，便于链式构造后保存。 */
-    public function setKey(string $id): static
-    {
-        $this->documentId = $id;
-        return $this;
     }
 
     /** 判断模型是否来自 ES 命中，而非新建对象。 */
@@ -141,7 +137,7 @@ abstract class DocumentModel
     }
 
     /**
-     * 创建并写入一个新文档，返回已标记为存在的模型实例。
+     * 创建并写入一个新文档；指定 ID 时拒绝覆盖已有文档。
      *
      * @param array<string, mixed> $attributes
      * @param array<string, mixed> $options
@@ -150,28 +146,83 @@ abstract class DocumentModel
     {
         $model = new static($attributes);
         if ($id !== null) {
-            $model->setKey($id);
+            $model->documentId = $id;
         }
-        return $model->save($client, $options);
+        $model->save($client, $options);
+        return $model;
     }
 
-    /** @param array<string, mixed> $options */
-    public function save(?ClientInterface $client = null, array $options = []): static
+    /**
+     * 新模型执行创建，已存在模型只更新改动字段；没有改动时直接成功。
+     *
+     * @param array<string, mixed> $options
+     */
+    public function save(?ClientInterface $client = null, array $options = []): bool
     {
-        $client ??= $this->resolveClient();
-        $params = array_replace($options, [
-            'index' => $this->getIndexName(),
-            'body' => $this->toDocument(),
-        ]);
-        if ($this->documentId !== null) {
-            $params['id'] = $this->documentId;
-        }
-        $raw = $client->responseToArray($client->index($params));
-        if (isset($raw['_id'])) {
+        $document = $this->toDocument();
+        if ($this->exists) {
+            if ($this->documentId === null) {
+                throw new \LogicException('Cannot update an Elasticsearch document without an ID.');
+            }
+            $changes = array_diff_key($document, $this->original);
+            foreach (array_intersect_key($document, $this->original) as $key => $value) {
+                if ($value !== $this->original[$key]) {
+                    $changes[$key] = $value;
+                }
+            }
+            if ($changes === []) {
+                return true;
+            }
+            $client ??= $this->resolveClient();
+            // ES update/doc 合并对象字段；只提交顶层脏字段可保护投影查询未加载的字段。
+            $client->responseToArray($client->update(array_replace($options, [
+                'index' => $this->getIndexName(),
+                'id' => $this->documentId,
+                'body' => ['doc' => $changes],
+            ])));
+            // 写入成功后同步已加载对象的合并结果，避免模型属性和脏字段快照分离。
+            // 投影查询中未加载的字段仍保持未知，与普通 ORM 的部分字段加载一致。
+            $this->fill(self::mergeDocument($this->original, $changes));
+        } else {
+            $client ??= $this->resolveClient();
+            $params = array_replace($options, [
+                'index' => $this->getIndexName(),
+                'body' => $document,
+            ]);
+            if ($this->documentId === null) {
+                $raw = $client->responseToArray($client->index($params));
+            } else {
+                $params['id'] = $this->documentId;
+                $raw = $client->responseToArray($client->create($params));
+            }
+            if (! isset($raw['_id']) || ! is_scalar($raw['_id']) || (string) $raw['_id'] === '') {
+                throw new \UnexpectedValueException('Elasticsearch create response did not contain a document ID.');
+            }
             $this->documentId = (string) $raw['_id'];
+            $this->exists = true;
         }
-        $this->exists = true;
-        return $this;
+        // 失败时不更新快照，保留本地改动以便调用方重试。
+        $this->original = $this->toDocument();
+        return true;
+    }
+
+    /**
+     * 模拟 ES update/doc 的对象递归合并；列表和标量作为完整字段替换。
+     *
+     * @param array<string, mixed> $original
+     * @param array<string, mixed> $changes
+     * @return array<string, mixed>
+     */
+    private static function mergeDocument(array $original, array $changes): array
+    {
+        foreach ($changes as $key => $value) {
+            $previous = $original[$key] ?? null;
+            $original[$key] = is_array($previous) && is_array($value)
+                && ! array_is_list($previous) && ! array_is_list($value)
+                ? self::mergeDocument($previous, $value)
+                : $value;
+        }
+        return $original;
     }
 
     /** 按 ES 文档 ID 读取并 hydrate 模型；只有明确的文档未命中返回 null。 */
@@ -196,17 +247,21 @@ abstract class DocumentModel
         $model->documentId = isset($raw['_id']) ? (string) $raw['_id'] : $id;
         $model->exists = true;
         $model->fill((array) ($raw['_source'] ?? []));
+        $model->original = $model->toDocument();
         return $model;
     }
 
     /**
-     * 更新属性并保存完整文档；Elasticsearch index 语义会覆盖当前文档。
+     * 仅更新已加载或已创建模型；失败时保留已填充的本地属性。
      *
      * @param array<string, mixed> $attributes
      * @param array<string, mixed> $options
      */
-    public function update(array $attributes, ?ClientInterface $client = null, array $options = []): static
+    public function update(array $attributes, ?ClientInterface $client = null, array $options = []): bool
     {
+        if (! $this->exists) {
+            return false;
+        }
         $this->fill($attributes);
         return $this->save($client, $options);
     }
@@ -334,6 +389,7 @@ abstract class DocumentModel
         $model->score = $hit->score;
         $model->sortValues = $hit->sort;
         $model->highlight = $hit->highlight;
+        $model->original = $model->toDocument();
         return $model;
     }
 

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.1 - 2026-09-24
+
+- 移除可修改已加载文档 ID 的 `DocumentModel::setKey()`；创建时通过 `create()` 的 ID 参数指定文档 ID。
+- 对象字段通过 `update/doc` 合并后，同步模型中已加载的对象字段及其脏字段快照。
+- 多次 `rawDsl()` 的列表字段改为整体替换，避免按数字下标合并排序和 bool 子句。
+- 模型 `save()` 依 `exists()` 执行创建或局部更新，`update()` 返回布尔值；投影模型只提交改动字段，避免整文档覆盖。
+- `QueryBuilder::chunk()` 以 Hyperf Collection 回调按批遍历，并管理 PIT、`search_after` 与资源关闭。
+- Bulk 中断和畸形响应通过专用异常保留先前已确认的块结果与失败块序号。
+
 ## 0.2.0 - 2026-09-24
 
 ### Compatibility and design

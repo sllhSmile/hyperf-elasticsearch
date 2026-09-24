@@ -34,6 +34,10 @@ final class DocumentModelTest extends TestCase
         $raw = new class {
             /** @var list<array<string, mixed>> */
             public array $indexCalls = [];
+            /** @var list<array<string, mixed>> */
+            public array $createCalls = [];
+            /** @var list<array<string, mixed>> */
+            public array $updateCalls = [];
 
             /**
              * @param array<string, mixed> $params
@@ -43,6 +47,26 @@ final class DocumentModelTest extends TestCase
             {
                 $this->indexCalls[] = $params;
                 return ['_id' => $params['id'] ?? 'generated-id', 'result' => 'created'];
+            }
+
+            /**
+             * @param array<string, mixed> $params
+             * @return array<string, mixed>
+             */
+            public function create(array $params): array
+            {
+                $this->createCalls[] = $params;
+                return ['_id' => $params['id'], 'result' => 'created'];
+            }
+
+            /**
+             * @param array<string, mixed> $params
+             * @return array<string, mixed>
+             */
+            public function update(array $params): array
+            {
+                $this->updateCalls[] = $params;
+                return ['_id' => $params['id'], 'result' => 'updated'];
             }
         };
         $client = ClientAdapterStub::client($raw);
@@ -57,13 +81,16 @@ final class DocumentModelTest extends TestCase
         self::assertTrue($model->exists());
         self::assertSame(10, $model->getAttribute('score'));
         self::assertSame('2026-09-07T12:00:00+08:00', $model->toArray()['published_at']);
-        self::assertSame('wait_for', $raw->indexCalls[0]['refresh']);
-        self::assertSame('article-1', $raw->indexCalls[0]['id']);
+        self::assertSame('wait_for', $raw->createCalls[0]['refresh']);
+        self::assertSame('article-1', $raw->createCalls[0]['id']);
 
-        $model->update(['score' => '11'], $client);
+        self::assertTrue($model->update(['score' => '11'], $client));
         self::assertSame(11, $model->getAttribute('score'));
-        self::assertCount(2, $raw->indexCalls);
-        self::assertSame(11, $raw->indexCalls[1]['body']['score']);
+        self::assertCount(0, $raw->indexCalls);
+        self::assertCount(1, $raw->updateCalls);
+        self::assertSame(['score' => 11], $raw->updateCalls[0]['body']['doc']);
+        self::assertTrue($model->save($client));
+        self::assertCount(1, $raw->updateCalls);
     }
 
     public function testSaveWithoutIdUsesReturnedIdAndFindHydratesSource(): void
@@ -99,7 +126,8 @@ final class DocumentModelTest extends TestCase
         };
         $client = ClientAdapterStub::client($raw);
 
-        $created = (new ModelArticle(['title' => 'Draft']))->save($client);
+        $created = new ModelArticle(['title' => 'Draft']);
+        self::assertTrue($created->save($client));
         self::assertSame('generated-id', $created->getKey());
         self::assertTrue($created->exists());
 
@@ -109,6 +137,108 @@ final class DocumentModelTest extends TestCase
         self::assertTrue($found->exists());
         self::assertSame('Elasticsearch', $found->getAttribute('title'));
         self::assertSame(7, $found->getAttribute('score'));
+    }
+
+    /** 投影模型的保存只提交被改动字段，且失败后可重试同一改动。 */
+    public function testProjectedModelUpdatesOnlyChangedFieldsAndRetainsFailedChanges(): void
+    {
+        $raw = new class {
+            /** @var list<array<string, mixed>> */
+            public array $updates = [];
+            public bool $fail = true;
+
+            /**
+             * @param array<string, mixed> $params
+             * @return array<string, mixed>
+             */
+            public function update(array $params): array
+            {
+                $this->updates[] = $params;
+                if ($this->fail) {
+                    throw new \RuntimeException('temporary failure');
+                }
+                return ['result' => 'updated'];
+            }
+        };
+        $client = ClientAdapterStub::client($raw);
+        $model = ModelArticle::fromSearchHit(new \SllhSmile\Elasticsearch\Response\SearchHit(['title' => 'Old'], 'a-1'));
+
+        try {
+            $model->update(['title' => 'New'], $client);
+            self::fail('Expected the first update to fail.');
+        } catch (\RuntimeException $exception) {
+            self::assertSame('temporary failure', $exception->getMessage());
+        }
+        self::assertSame('New', $model->getAttribute('title'));
+        $raw->fail = false;
+        self::assertTrue($model->save($client));
+        self::assertSame(['doc' => ['title' => 'New']], $raw->updates[1]['body']);
+        self::assertTrue($model->save($client));
+        self::assertCount(2, $raw->updates);
+    }
+
+    /** Eloquent 风格：未持久化模型的 update 返回 false，属性保持原值。 */
+    public function testUpdateOfNewModelReturnsFalse(): void
+    {
+        $model = new ModelArticle(['title' => 'Draft']);
+        self::assertFalse($model->update(['title' => 'Changed']));
+        self::assertSame('Draft', $model->getAttribute('title'));
+    }
+
+    /** 更新对象后同步已加载字段，后续无改动的 save 不再发送请求。 */
+    public function testObjectUpdateKeepsLoadedFieldsInModelAndSnapshot(): void
+    {
+        $raw = new class {
+            /** @var list<array<string, mixed>> */
+            public array $updates = [];
+
+            /**
+             * @param array<string, mixed> $params
+             * @return array<string, mixed>
+             */
+            public function update(array $params): array
+            {
+                $this->updates[] = $params;
+                return ['result' => 'updated'];
+            }
+        };
+        $client = ClientAdapterStub::client($raw);
+        $model = ModelArticle::fromSearchHit(new \SllhSmile\Elasticsearch\Response\SearchHit([
+            'profile' => ['name' => '张三', 'age' => 30, 'address' => ['city' => '上海', 'street' => '旧街']],
+            'tags' => ['old'],
+        ], 'article-1'));
+
+        self::assertTrue($model->update([
+            'profile' => ['name' => '李四', 'address' => ['street' => '新街']],
+            'tags' => ['new'],
+        ], $client));
+        self::assertSame([
+            'name' => '李四',
+            'age' => 30,
+            'address' => ['city' => '上海', 'street' => '新街'],
+        ], $model->getAttribute('profile'));
+        self::assertSame(['new'], $model->getAttribute('tags'));
+        self::assertCount(1, $raw->updates);
+        self::assertTrue($model->save($client));
+        self::assertCount(1, $raw->updates);
+    }
+
+    /** 指定 ID 的创建冲突由 ES 返回，模型仍保持未持久化状态。 */
+    public function testCreateWithExistingIdPreservesConflictAndModelState(): void
+    {
+        $raw = new class {
+            /** @param array<string, mixed> $params */
+            public function create(array $params): never
+            {
+                throw new ResponseException('version conflict', 409);
+            }
+        };
+        try {
+            ModelArticle::create(['title' => 'Duplicate'], 'a-1', ClientAdapterStub::client($raw));
+            self::fail('Expected a 409 conflict.');
+        } catch (ResponseException $exception) {
+            self::assertSame(409, $exception->statusCode());
+        }
     }
 
     public function testFindConvertsDocumentNotFoundResponseToNull(): void
@@ -193,7 +323,7 @@ final class DocumentModelTest extends TestCase
             }
         };
         $client = ClientAdapterStub::client($raw);
-        $model = (new ModelArticle(['title' => 'PHP']))->setKey('article-3');
+        $model = ModelArticle::fromSearchHit(new \SllhSmile\Elasticsearch\Response\SearchHit(['title' => 'PHP'], 'article-3'));
 
         self::assertTrue($model->delete($client));
         self::assertFalse($model->exists());
@@ -209,6 +339,15 @@ final class DocumentModelTest extends TestCase
             public function index(array $params): array
             {
                 return ['_id' => $params['id'] ?? 'created', 'result' => 'created'];
+            }
+
+            /**
+             * @param array<string, mixed> $params
+             * @return array<string, mixed>
+             */
+            public function create(array $params): array
+            {
+                return ['_id' => $params['id'], 'result' => 'created'];
             }
 
             /**

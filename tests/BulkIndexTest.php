@@ -7,6 +7,8 @@ namespace SllhSmile\Elasticsearch\Tests;
 use PHPUnit\Framework\TestCase;
 use SllhSmile\Elasticsearch\Bulk\BulkManager;
 use SllhSmile\Elasticsearch\Bulk\BulkOperation;
+use SllhSmile\Elasticsearch\Exception\BulkExecutionException;
+use SllhSmile\Elasticsearch\Exception\BulkProtocolException;
 use SllhSmile\Elasticsearch\Client\ElasticsearchClient;
 use SllhSmile\Elasticsearch\Tests\Support\ClientAdapterStub;
 
@@ -76,5 +78,64 @@ final class BulkIndexTest extends TestCase
         self::assertSame(0, $raw->requests);
         self::assertSame([], $result->items);
         self::assertFalse($result->hasErrors());
+    }
+
+    /** 中途请求失败时仅前面完成的块可用于安全地决定后续重试。 */
+    public function testInterruptedBulkCarriesConfirmedResult(): void
+    {
+        $raw = new class {
+            public int $calls = 0;
+            /**
+             * @param array<string, mixed> $params
+             * @return array<string, mixed>
+             */
+            public function bulk(array $params): array
+            {
+                ++$this->calls;
+                if ($this->calls === 2) {
+                    throw new \RuntimeException('connection lost');
+                }
+                return ['items' => [['index' => ['status' => 201]]]];
+            }
+        };
+        try {
+            (new BulkManager(ClientAdapterStub::client($raw), 1))->execute([
+                BulkOperation::index('articles', '1', ['title' => 'One']),
+                BulkOperation::index('articles', '2', ['title' => 'Two']),
+            ]);
+            self::fail('Expected BulkExecutionException.');
+        } catch (BulkExecutionException $exception) {
+            self::assertSame(2, $exception->failedChunk);
+            self::assertCount(1, $exception->completedResult->items);
+            self::assertCount(1, $exception->completedResult->raw);
+            self::assertSame('connection lost', $exception->getPrevious()?->getMessage());
+        }
+    }
+
+    /** 缺少 status 的成功 HTTP 响应不可伪装为成功的 Bulk 项。 */
+    public function testMalformedBulkResponseCarriesPreviousChunkOnly(): void
+    {
+        $raw = new class {
+            public int $calls = 0;
+            /**
+             * @param array<string, mixed> $params
+             * @return array<string, mixed>
+             */
+            public function bulk(array $params): array
+            {
+                ++$this->calls;
+                return ['items' => [['index' => $this->calls === 1 ? ['status' => 201] : []]]];
+            }
+        };
+        try {
+            (new BulkManager(ClientAdapterStub::client($raw), 1))->execute([
+                BulkOperation::index('articles', '1', []),
+                BulkOperation::index('articles', '2', []),
+            ]);
+            self::fail('Expected BulkProtocolException.');
+        } catch (BulkProtocolException $exception) {
+            self::assertSame(2, $exception->failedChunk);
+            self::assertCount(1, $exception->completedResult->items);
+        }
     }
 }

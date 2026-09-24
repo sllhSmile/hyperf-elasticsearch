@@ -158,21 +158,43 @@ $article = Article::create([
     'published_at' => '2026-09-07T12:00:00+08:00',
 ], 'article-1');
 
-$article->fill(['views' => 11])->setKey('article-1')->save();
-$article->update(['views' => 12]);
+$saved = $article->fill(['views' => 11])->save(); // bool
+$updated = $article->update(['views' => 12]); // bool
 $article->delete();
 
 $article = Article::find('article-1'); // 不存在时返回 null
 ```
 
-`create()` 和 `save()` 返回保留当前属性的模型，并将服务端返回的 `_id` 写回模型。已有 ID
-的 `save()` 使用 `index` 覆盖写入；没有 ID 时由 Elasticsearch 生成 ID。`update()` 是填充属性后
-再次保存完整文档的便捷方法，不模拟关系型数据库事务。`delete()` 成功后将 `exists()` 设为
+`create()` 返回模型；新模型 `save()` 在有 ID 时使用 ES `create` 接口，无 ID 时由 ES 生成 ID；
+指定 ID 已存在会收到 409。已有模型 `save()` 只把改动字段提交到 ES `update/doc`，未改动时
+不发请求。`update()` 先填充属性再调用 `save()`，两者均返回 `bool`；未持久化模型的 `update()`
+返回 `false`。写入失败后本地改动仍保留，可检查后重试。对象字段使用 ES `update/doc` 的合并语义，
+例如更新 `profile.name` 不会删除已加载的 `profile.age`；写入成功后模型属性与快照也会合并这些已加载字段。
+投影查询未加载的字段仍不会出现在 `toArray()` 中。文档 ID 在创建时通过 `create($attributes, $id)` 指定，
+已加载模型的更新和删除使用读取时获得的 ID。`delete()` 成功后将 `exists()` 设为
 `false`。`find()` 会把 `_source` hydrate 到模型并执行入站 casts。只有响应明确包含
 `found: false` 的 HTTP 404 会转换为 `null`；索引不存在、无法识别的 404 和其他响应错误继续抛出
 `ResponseException`，避免把部署故障伪装成文档未命中。
 
-### 4.2 QueryBuilder 写入和链式查询
+### 4.2 按批遍历查询结果
+
+```php
+use Hyperf\Collection\Collection;
+
+$completed = Article::query()->where('status', 'published')->orderBy('created_at')
+    ->chunk(500, function (Collection $articles, int $page): bool {
+        foreach ($articles as $article) {
+            // 处理当前批次的模型。
+        }
+        return true; // 严格返回 false 时提前停止
+    });
+```
+
+`chunk()` 使用 PIT 和 `search_after`，回调收到从 1 开始的批次号。已有 `from()`/`size()`
+分别作为起始偏移和总量限制；已设置 `pit()` 或 `searchAfter()` 时不能再调用 `chunk()`。
+回调异常和提前停止时也会关闭最新 PIT。遍历期间不要改变查询条件或排序字段对应的文档。
+
+### 4.3 QueryBuilder 写入和链式查询
 
 模型 QueryBuilder 与模型静态 API 使用同一个连接和 adapter：
 
@@ -249,7 +271,7 @@ $response = Article::query()
 即使 `$options` 中包含 `order`，也不会覆盖已经校验的 `$direction`；其他排序选项如
 `mode`、`missing` 会原样保留。
 
-`toDsl(): array` 只编译，不访问网络。`rawDsl()` 递归合并多次传入的 raw 片段，但不允许覆盖链式 API 已生成的顶层键。需要完整控制请求体时，应在全新的 Builder 上直接调用 `rawDsl()`。链式 DSL 与 raw DSL 的同名顶层键内容不一致时，`toDsl()` 会抛出 `InvalidArgumentException`。
+`toDsl(): array` 只编译，不访问网络。多次调用 `rawDsl()` 时，对象键递归合并，`sort`、`must` 等列表整体替换；它不能覆盖链式 API 已生成的顶层键。需要完整控制请求体时，应在全新的 Builder 上直接调用 `rawDsl()`。链式 DSL 与 raw DSL 的同名顶层键内容不一致时，`toDsl()` 会抛出 `InvalidArgumentException`。
 
 `search(): SearchResponse` 将 DSL 放在各版本通用的 `body` 中；`get()` 是别名。`first()` 和 `count()` 会克隆 Builder，分别设置 `size(1)`、`size(0)`，因此不会修改原实例；如果 raw DSL 已经包含不同的 `size`，冲突检查仍会生效。
 
@@ -305,7 +327,7 @@ $result = $client->bulkManager(500)->execute([
 $result->items; $result->errors; $result->hasErrors(); $result->raw;
 ```
 
-`BulkOperation::toNdjsonLines()` 返回 action 行和（除 delete 外）source 行。`BulkManager::execute` 按 chunk size 分块，每块调用一次 `bulk`；`BulkResult` 汇总所有 item 和错误数。Bulk 请求体由官方客户端编码为 NDJSON。
+`BulkOperation::toNdjsonLines()` 返回 action 行和（除 delete 外）source 行。`BulkManager::execute` 按 chunk size 分块，每块调用一次 `bulk`；`BulkResult` 汇总所有 item 和错误数。Bulk 请求体由官方客户端编码为 NDJSON。传输中断时抛 `BulkExecutionException`，其 `completedResult` 仅包含先前已确认的块，`failedChunk` 从 1 开始；失败块的提交状态未知。响应缺少 `items`、数量不符、动作不匹配或缺少 `status` 时抛 `BulkProtocolException`。
 
 ## 11. 索引与 Alias 管理
 

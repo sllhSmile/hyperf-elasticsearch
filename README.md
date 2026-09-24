@@ -197,7 +197,7 @@ $article?->update(['views' => 11]);
 $article?->delete();
 ```
 
-`create()`、`save()` 和 `update()` 返回保留当前属性的模型，并写回服务端返回的 `_id`。`exists()` 表示模型是否已写入或从 Elasticsearch 命中，`getKey()` 返回文档 `_id`。
+`create()` 返回模型，并写回服务端返回的 `_id`；指定已有 ID 会收到 409。`save()` 和 `update()` 返回 `bool`：新模型由 `save()` 创建，已有模型仅提交改动字段；未持久化模型调用 `update()` 返回 `false`。`exists()` 表示模型是否已写入或从 Elasticsearch 命中，`getKey()` 返回文档 `_id`。
 
 ### 链式查询
 

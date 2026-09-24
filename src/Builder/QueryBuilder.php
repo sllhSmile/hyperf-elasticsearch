@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace SllhSmile\Elasticsearch\Builder;
 
+use Hyperf\Collection\Collection;
+use SllhSmile\Elasticsearch\Client\PitManager;
 use SllhSmile\Elasticsearch\Contract\ClientInterface;
 use SllhSmile\Elasticsearch\Model\DocumentModel;
 use SllhSmile\Elasticsearch\Response\SearchResponse;
@@ -261,7 +263,7 @@ final class QueryBuilder
     }
 
     /**
-     * 递归合并原始 DSL；不得覆盖链式 API 已生成的同名顶层字段。
+     * 合并原始 DSL 的对象字段，列表整体替换；不得覆盖链式 API 已生成的同名顶层字段。
      *
      * @param array<string, mixed> $dsl
      */
@@ -271,8 +273,28 @@ final class QueryBuilder
             $this->rawDsl = $dsl;
             return $this;
         }
-        $this->rawDsl = array_replace_recursive($this->rawDsl, $dsl);
+        $this->rawDsl = self::mergeRawDsl($this->rawDsl, $dsl);
         return $this;
+    }
+
+    /**
+     * 对象键递归合并，避免 PHP 按数字下标把两次传入的 sort/bool 子句拼成一个子句。
+     *
+     * @param array<mixed> $previous
+     * @param array<mixed> $incoming
+     * @return array<mixed>
+     */
+    private static function mergeRawDsl(array $previous, array $incoming): array
+    {
+        foreach ($incoming as $key => $value) {
+            if (isset($previous[$key]) && is_array($previous[$key]) && is_array($value)
+                && ! array_is_list($previous[$key]) && ! array_is_list($value)) {
+                $previous[$key] = self::mergeRawDsl($previous[$key], $value);
+                continue;
+            }
+            $previous[$key] = $value;
+        }
+        return $previous;
     }
 
     /**
@@ -324,11 +346,114 @@ final class QueryBuilder
      */
     public function create(array $attributes, ?string $id = null, array $options = []): DocumentModel
     {
-        $model = new $this->modelClass($attributes);
-        if ($id !== null) {
-            $model->setKey($id);
+        return $this->modelClass::create($attributes, $id, $this->client, $options);
+    }
+
+    /**
+     * 使用 PIT 和 search_after 按批遍历；回调返回严格的 false 时提前结束。
+     * 已有 from/size 分别作为起始偏移和总量上限；不修改调用方的 Builder。
+     *
+     * @param callable(Collection<int, DocumentModel>, int): mixed $callback
+     */
+    public function chunk(int $count, callable $callback): bool
+    {
+        if ($count < 1) {
+            throw new \InvalidArgumentException('chunk count must be greater than zero.');
         }
-        return $model->save($this->client, $options);
+        $dsl = $this->toDsl();
+        if (isset($dsl['pit']) || isset($dsl['search_after'])) {
+            throw new \InvalidArgumentException('chunk cannot be combined with an existing PIT or search_after cursor.');
+        }
+        $skip = $dsl['from'] ?? 0;
+        $remaining = $dsl['size'] ?? null;
+        if (! is_int($skip) || $skip < 0 || ($remaining !== null && (! is_int($remaining) || $remaining < 0))) {
+            throw new \InvalidArgumentException('chunk requires non-negative integer from and size values.');
+        }
+        if ($remaining === 0) {
+            return true;
+        }
+        unset($dsl['from'], $dsl['size']);
+        // _shard_doc 在同一 PIT 内提供稳定的并列值顺序。
+        $dsl['sort'] = array_merge((array) ($dsl['sort'] ?? []), [['_shard_doc' => 'asc']]);
+        $pit = new PitManager($this->client);
+        $pitId = $pit->open($this->index);
+        $page = 1;
+        $cursor = null;
+        $lastSort = null;
+        $failure = null;
+        $result = true;
+        try {
+            while (true) {
+                $body = $dsl;
+                $body['size'] = $remaining === null ? $count : min($count, $remaining);
+                $body['pit'] = ['id' => $pitId, 'keep_alive' => '1m'];
+                if ($cursor !== null) {
+                    $body['search_after'] = $cursor;
+                }
+                $raw = $this->client->responseToArray($this->client->search(['body' => $body]));
+                if (isset($raw['pit_id']) && is_string($raw['pit_id']) && $raw['pit_id'] !== '') {
+                    $pitId = $raw['pit_id'];
+                }
+                if (! isset($raw['hits']['hits']) || ! is_array($raw['hits']['hits']) || ! array_is_list($raw['hits']['hits'])) {
+                    throw new \UnexpectedValueException('PIT search response did not contain a hits list.');
+                }
+                $hits = array_map(static function (SearchHit|DocumentModel $hit): DocumentModel {
+                    if (! $hit instanceof DocumentModel) {
+                        throw new \UnexpectedValueException('Model query returned a non-model search hit.');
+                    }
+                    return $hit;
+                }, (new SearchResponse($raw, $this->modelClass))->hits());
+                if ($hits === []) {
+                    break;
+                }
+                $lastHit = $raw['hits']['hits'][array_key_last($raw['hits']['hits'])] ?? null;
+                if (! is_array($lastHit) || ! isset($lastHit['sort']) || ! is_array($lastHit['sort']) || $lastHit['sort'] === []) {
+                    throw new \UnexpectedValueException('PIT search response did not contain sort values for search_after.');
+                }
+                $cursor = array_values($lastHit['sort']);
+                if ($cursor === $lastSort) {
+                    throw new \UnexpectedValueException('PIT search_after cursor did not advance.');
+                }
+                $lastSort = $cursor;
+                // 偏移只用于首段遍历；后续请求始终沿用服务端游标。
+                if ($skip > 0) {
+                    $seen = count($hits);
+                    $hits = array_slice($hits, $skip);
+                    $skip = max(0, $skip - $seen);
+                    if ($hits === []) {
+                        if ($seen < $body['size']) {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+                if ($remaining !== null) {
+                    $hits = array_slice($hits, 0, $remaining);
+                    $remaining -= count($hits);
+                }
+                if ($callback(new Collection($hits), $page) === false) {
+                    $result = false;
+                    break;
+                }
+                $page++;
+                if ($remaining === 0 || count($raw['hits']['hits']) < $body['size']) {
+                    break;
+                }
+            }
+        } catch (\Throwable $exception) {
+            $failure = $exception;
+        }
+        try {
+            $pit->close($pitId);
+        } catch (\Throwable $closeException) {
+            if ($failure === null) {
+                throw $closeException;
+            }
+        }
+        if ($failure !== null) {
+            throw $failure;
+        }
+        return $result;
     }
 
     /**
