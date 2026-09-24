@@ -4,7 +4,14 @@ declare(strict_types=1);
 
 namespace SllhSmile\Elasticsearch\Adapter;
 
+use Elastic\Elasticsearch\Client;
+use Elastic\Elasticsearch\Exception\ClientResponseException;
+use Elastic\Elasticsearch\Exception\ElasticsearchException as OfficialElasticsearchException;
+use Elastic\Elasticsearch\Exception\ServerResponseException;
+use Elastic\Transport\Exception\NoNodeAvailableException;
+use Elastic\Transport\Exception\TransportException as OfficialTransportException;
 use Psr\Http\Client\ClientExceptionInterface as PsrClientExceptionInterface;
+use Psr\Http\Client\NetworkExceptionInterface;
 use SllhSmile\Elasticsearch\Contract\ClientAdapterInterface;
 use SllhSmile\Elasticsearch\Exception\ElasticsearchException;
 use SllhSmile\Elasticsearch\Exception\ResponseException;
@@ -14,46 +21,33 @@ use Throwable;
 /**
  * 官方客户端 endpoint 的共同分派逻辑。
  *
- * ES7 返回数组，ES8/9 默认返回 Response 对象；版本 adapter 共享这里的
- * operation 映射，但通过 clientMajor 保留各版本能力边界。
+ * SDK 8/9 共用 endpoint、响应与异常契约，无需运行时版本分支。
  */
-class OfficialClientAdapter implements ClientAdapterInterface
+final class OfficialClientAdapter implements ClientAdapterInterface
 {
-    /** 保存官方客户端及其主版本，供统一 endpoint 分派和能力声明使用。 */
-    public function __construct(
-        private readonly object $client,
-        private readonly int $clientMajor = ClientMajor::ES9,
-    )
-    {
-    }
+    /** 保存类型明确的官方客户端，避免任意 object 鸭子类型延迟失败。 */
+    public function __construct(private readonly Client $client) {}
 
-    /** 将稳定 operation 名映射到不同版本官方客户端共有的 endpoint。 */
+    /**
+     * 将稳定 operation 名映射到不同版本官方客户端共有的 endpoint。
+     *
+     * @param array<string, mixed> $params
+     */
     public function call(string $operation, array $params = []): mixed
     {
         return match ($operation) {
-            'info' => $this->client->info($params),
-            'search' => $this->client->search($params),
-            'get' => $this->client->get($params),
-            'index' => $this->client->index($params),
-            'create' => $this->client->create($params),
-            'update' => $this->client->update($params),
-            'delete' => $this->client->delete($params),
-            'bulk' => $this->client->bulk($params),
-            'indices.create' => $this->client->indices()->create($params),
-            'indices.delete' => $this->client->indices()->delete($params),
-            'indices.exists' => $this->client->indices()->exists($params),
-            'indices.getMapping' => $this->client->indices()->getMapping($params),
-            'indices.putMapping' => $this->client->indices()->putMapping($params),
-            'indices.getSettings' => $this->client->indices()->getSettings($params),
-            'indices.putSettings' => $this->client->indices()->putSettings($params),
-            'indices.updateAliases' => $this->client->indices()->updateAliases($params),
-            'pit.open' => $this->client->openPointInTime($params),
-            'pit.close' => $this->client->closePointInTime($params),
+            'info', 'search', 'get', 'index', 'create', 'update', 'delete', 'bulk' =>
+                $this->invoke($this->client, $operation, $params),
+            'indices.create', 'indices.delete', 'indices.exists', 'indices.getMapping',
+            'indices.putMapping', 'indices.getSettings', 'indices.putSettings', 'indices.updateAliases' =>
+                $this->invoke($this->client->indices(), substr($operation, 8), $params),
+            'pit.open' => $this->invoke($this->client, 'openPointInTime', $params),
+            'pit.close' => $this->invoke($this->client, 'closePointInTime', $params),
             default => throw new \BadMethodCallException("Unsupported Elasticsearch operation [{$operation}]."),
         };
     }
 
-    /** 将 ES7 数组或 ES8/9 响应对象统一转换为数组。 */
+    /** @return array<mixed> */
     public function responseToArray(mixed $response): array
     {
         if (is_array($response)) {
@@ -66,7 +60,10 @@ class OfficialClientAdapter implements ClientAdapterInterface
                 }
             }
         }
-        return (array) $response;
+        throw new \UnexpectedValueException(sprintf(
+            'Elasticsearch response [%s] cannot be converted to an array.',
+            get_debug_type($response),
+        ));
     }
 
     /** 将各版本 exists 响应统一转换为布尔值。 */
@@ -78,13 +75,10 @@ class OfficialClientAdapter implements ClientAdapterInterface
         if (is_object($response) && method_exists($response, 'asBool')) {
             return $response->asBool();
         }
-        return (bool) $response;
-    }
-
-    /** 返回与当前官方客户端主版本关联的协议能力。 */
-    public function capabilities(): ClientCapabilities
-    {
-        return new ClientCapabilities($this->clientMajor);
+        throw new \UnexpectedValueException(sprintf(
+            'Elasticsearch response [%s] cannot be converted to a boolean.',
+            get_debug_type($response),
+        ));
     }
 
     /** 将官方客户端和 PSR 传输异常归一化为包内稳定异常类型。 */
@@ -94,71 +88,49 @@ class OfficialClientAdapter implements ClientAdapterInterface
             return $exception;
         }
 
-        // 先识别无可用节点、DNS 和 HTTP 传输故障，避免误归类为服务端响应错误。
-        $transportClasses = $this->availableClasses([
-            'Elastic\\Transport\\Exception\\TransportException',
-            'Elastic\\Transport\\Exception\\NoNodeAvailableException',
-            'Elasticsearch\\Common\\Exceptions\\NoNodesAvailableException',
-        ]);
-        foreach ($transportClasses as $class) {
-            if ($exception instanceof $class) {
-                return new TransportException($exception->getMessage(), (int) $exception->getCode(), $exception);
-            }
-        }
-        if ($exception instanceof PsrClientExceptionInterface) {
+        // 只有确定的网络或节点故障才允许触发客户端重建。
+        if ($exception instanceof NoNodeAvailableException
+            || $exception instanceof NetworkExceptionInterface) {
             return new TransportException($exception->getMessage(), (int) $exception->getCode(), $exception);
         }
 
-        // 官方 7/8/9 的响应异常命名不同，但都保留状态码和原始响应供业务判断。
-        $responseClasses = $this->availableClasses([
-            'Elastic\\Elasticsearch\\Exception\\ClientResponseException',
-            'Elastic\\Elasticsearch\\Exception\\ServerResponseException',
-            'Elasticsearch\\Common\\Exceptions\\ClientErrorResponseException',
-            'Elasticsearch\\Common\\Exceptions\\ServerErrorResponseException',
-            'Elasticsearch\\Common\\Exceptions\\BadRequest400Exception',
-            'Elasticsearch\\Common\\Exceptions\\Unauthorized401Exception',
-            'Elasticsearch\\Common\\Exceptions\\Forbidden403Exception',
-            'Elasticsearch\\Common\\Exceptions\\Missing404Exception',
-            'Elasticsearch\\Common\\Exceptions\\Conflict409Exception',
-        ]);
-        foreach ($responseClasses as $class) {
-            if (! $exception instanceof $class) {
-                continue;
-            }
+        // 官方响应异常保留状态码和原始响应，供业务判断客户端或服务端错误。
+        if ($exception instanceof ClientResponseException || $exception instanceof ServerResponseException) {
             $response = null;
-            if (method_exists($exception, 'getResponse')) {
-                try {
-                    $response = $exception->getResponse();
-                } catch (Throwable) {
-                }
+            try {
+                $response = $exception->getResponse();
+            } catch (Throwable) {
             }
-            $statusCode = $response !== null && method_exists($response, 'getStatusCode')
-                ? (int) $response->getStatusCode()
-                : (int) $exception->getCode();
+            $statusCode = $response !== null ? $response->getStatusCode() : (int) $exception->getCode();
             return new ResponseException($exception->getMessage(), $statusCode, $response, $exception);
         }
 
-        return new ElasticsearchException($exception->getMessage(), (int) $exception->getCode(), $exception);
+        if ($exception instanceof OfficialElasticsearchException
+            || $exception instanceof OfficialTransportException
+            || $exception instanceof PsrClientExceptionInterface) {
+            return new ElasticsearchException($exception->getMessage(), (int) $exception->getCode(), $exception);
+        }
+
+        // 业务回调和包内编程错误必须保持原始类型，避免隐藏真实调用栈语义。
+        return $exception;
     }
 
     /** 返回底层官方客户端，供尚未封装的 endpoint 使用。 */
-    public function raw(): object
+    public function raw(): Client
     {
         return $this->client;
     }
 
     /**
-     * 过滤当前依赖版本中实际存在的异常类型，避免跨版本 instanceof 触发无效引用。
+     * 在已由 match 白名单约束的前提下调用官方生成 endpoint。
      *
-     * @param list<string> $classes
+     * 官方 SDK 为每个 endpoint 生成不同 array-shape，而本包公共契约保留通用 DSL 数组，
+     * 因此统一分派必须在此动态调用。
      *
-     * @return list<string>
+     * @param array<string, mixed> $params
      */
-    private function availableClasses(array $classes): array
+    private function invoke(object $target, string $method, array $params): mixed
     {
-        return array_values(array_filter(
-            $classes,
-            static fn (string $class): bool => class_exists($class) || interface_exists($class),
-        ));
+        return $target->{$method}($params);
     }
 }

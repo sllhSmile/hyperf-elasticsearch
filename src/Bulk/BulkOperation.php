@@ -9,24 +9,27 @@ namespace SllhSmile\Elasticsearch\Bulk;
  */
 final class BulkOperation
 {
-    /** 仅由静态工厂创建，保证 metadata/source 结构合法。 */
-    private function __construct(private readonly array $meta, private readonly ?array $source = null)
-    {
-    }
+    /**
+     * 仅由静态工厂创建，保证 metadata/source 结构合法。
+     *
+     * @param array<string, mixed> $meta
+     * @param null|array<string, mixed> $source
+     */
+    private function __construct(private readonly array $meta, private readonly ?array $source = null) {}
 
-    /** 创建 index 动作（metadata 行 + source 行）。 */
+    /** @param array<string, mixed> $document */
     public static function index(string $index, string $id, array $document): self
     {
         return new self(['index' => ['_index' => $index, '_id' => $id]], $document);
     }
 
-    /** 创建 create 动作，文档已存在时由 ES 返回冲突。 */
+    /** @param array<string, mixed> $document */
     public static function create(string $index, string $id, array $document): self
     {
         return new self(['create' => ['_index' => $index, '_id' => $id]], $document);
     }
 
-    /** 创建 update 动作，可选 doc_as_upsert。 */
+    /** @param array<string, mixed> $doc */
     public static function update(string $index, string $id, array $doc, bool $docAsUpsert = false): self
     {
         return new self(['update' => ['_index' => $index, '_id' => $id]], ['doc' => $doc, 'doc_as_upsert' => $docAsUpsert]);
@@ -38,7 +41,7 @@ final class BulkOperation
         return new self(['delete' => ['_index' => $index, '_id' => $id]]);
     }
 
-    /** 按 ES Bulk 顺序返回 metadata/source 行；不进行 JSON 编码。 */
+    /** @return list<array<string, mixed>> */
     public function toNdjsonLines(): array
     {
         return $this->source === null ? [$this->meta] : [$this->meta, $this->source];

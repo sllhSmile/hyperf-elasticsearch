@@ -9,18 +9,23 @@ use SllhSmile\Elasticsearch\Contract\ClientInterface;
 /** Bulk 执行器：按块组织动作并汇总 ES 的逐项结果。 */
 final class BulkManager
 {
+    /** @var positive-int */
+    private readonly int $chunkSize;
+
     /** 绑定客户端并校验每次请求允许包含的最大操作数。 */
-    public function __construct(private readonly ClientInterface $client, private readonly int $chunkSize = 500)
+    public function __construct(private readonly ClientInterface $client, int $chunkSize = 500)
     {
         if ($chunkSize < 1) {
             throw new \InvalidArgumentException('Bulk chunk size must be greater than zero.');
         }
+        $this->chunkSize = $chunkSize;
     }
 
     /**
      * 按 chunkSize 拆分操作并汇总逐项结果；不会因单个 item 失败而提前终止。
      *
      * @param list<BulkOperation> $operations
+     * @param array<string, mixed> $options
      */
     public function execute(array $operations, array $options = []): BulkResult
     {

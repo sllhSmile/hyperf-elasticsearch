@@ -10,14 +10,17 @@ use SllhSmile\Elasticsearch\Contract\ClientInterface;
 final class IndexManager
 {
     /** 绑定版本无关客户端，所有索引操作仍通过统一异常边界执行。 */
-    public function __construct(private readonly ClientInterface $client)
-    {
-    }
+    public function __construct(private readonly ClientInterface $client) {}
 
-    /** 创建索引，并省略空的 settings 或 mappings 节点。 */
+    /**
+     * 创建索引，并省略空的 settings 或 mappings 节点。
+     *
+     * @param array<string, mixed> $settings
+     * @param array<string, mixed> $mappings
+     */
     public function create(string $index, array $settings = [], array $mappings = []): mixed
     {
-        $body = array_filter(['settings' => $settings, 'mappings' => $mappings], static fn (mixed $v): bool => $v !== []);
+        $body = array_filter(['settings' => $settings, 'mappings' => $mappings], static fn(mixed $v): bool => $v !== []);
         return $this->client->call('indices.create', ['index' => $index, 'body' => $body]);
     }
 
@@ -39,7 +42,12 @@ final class IndexManager
         return $this->client->call('indices.getMapping', ['index' => $index]);
     }
 
-    /** 更新指定索引的字段 properties，并透传额外 endpoint 参数。 */
+    /**
+     * 更新指定索引的字段 properties，并透传额外 endpoint 参数。
+     *
+     * @param array<string, mixed> $properties
+     * @param array<string, mixed> $options
+     */
     public function putMapping(string $index, array $properties, array $options = []): mixed
     {
         return $this->client->call('indices.putMapping', array_replace($options, [
@@ -54,13 +62,13 @@ final class IndexManager
         return $this->client->call('indices.getSettings', ['index' => $index]);
     }
 
-    /** 更新指定索引的动态 settings。 */
+    /** @param array<string, mixed> $settings */
     public function putSettings(string $index, array $settings): mixed
     {
         return $this->client->call('indices.putSettings', ['index' => $index, 'body' => $settings]);
     }
 
-    /** 通过原子 alias action 为索引添加别名。 */
+    /** @param array<string, mixed> $options */
     public function addAlias(string $index, string $alias, array $options = []): mixed
     {
         $add = array_replace($options, ['index' => $index, 'alias' => $alias]);

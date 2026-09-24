@@ -1,11 +1,16 @@
 # 使用文档
 
-本文以 Hyperf 3.0+ 和 Elasticsearch 7.17/8/9 为目标，示例均假定已在容器中取得 `Manager`。除特别说明外，调用链上的方法只是在内存中累积 DSL，`search`、`index`、`create`、`update`、`delete`、Bulk、索引和 PIT 方法才会发起网络请求。
+本文以 Hyperf 3.0+ 和 Elasticsearch 8/9 为目标，示例均假定已在容器中取得 `Manager`。除特别说明外，调用链上的方法只是在内存中累积 DSL，`search`、`index`、`create`、`update`、`delete`、Bulk、索引和 PIT 方法才会发起网络请求。
 
 ## 1. 安装与配置
 
+根据 Elasticsearch Server 主版本选择对应 SDK：
+
 ```bash
-composer require sllhsmile/hyperf-elasticsearch
+composer require sllhsmile/hyperf-elasticsearch "elasticsearch/elasticsearch:^8"
+# 或
+composer require sllhsmile/hyperf-elasticsearch "elasticsearch/elasticsearch:^9"
+
 php bin/hyperf.php vendor:publish sllhsmile/hyperf-elasticsearch --id=elasticsearch-config
 ```
 
@@ -18,28 +23,75 @@ ELASTICSEARCH_RETRIES=2
 ELASTICSEARCH_VERIFY_TLS=true
 ```
 
-不要把密钥提交到 Git 或打印到日志。`api_key` 填写 Elasticsearch 创建 API Key 响应中的 base64 `encoded` 值。依赖组合为 Hyperf/`hyperf-elasticsearch` 3.0 或 3.1 + ES7，或 Hyperf/`hyperf-elasticsearch` 3.2 + ES8/9；宿主可显式约束 `elasticsearch/elasticsearch:^7.17`、`^8` 或 `^9`。包复用对应版本的官方 Hyperf 工厂；ES8/9 的 `timeout`、`connect_timeout`、TLS 和 `client_options` 会在创建协程 Guzzle client 时一次性注入。
+不要把密钥提交到 Git 或打印到日志。`api_key` 填写 Elasticsearch 创建 API Key 响应中的 base64 `encoded` 值。本包保留 Hyperf 3.0/3.1/3.2 支持，通过官方 SDK Builder 与 Hyperf Guzzle 工厂构建客户端，不依赖 `hyperf/elasticsearch`。宿主按服务端版本约束 `elasticsearch/elasticsearch:^8` 或 `^9`。配置只暴露跨版本可验证的总 `timeout`、TLS 和重试语义，不透传任意底层 client options。
+
+连接字段如下。未知字段、错误类型、无效 URL、认证冲突会在 `Manager` 构造时抛出 `ConfigurationException`，此时还不会访问网络。
+
+| 字段 | 类型与默认值 | 说明 |
+| --- | --- | --- |
+| `hosts` | `list<string>`，必填 | 一个或多个不含凭据、query、fragment 的 HTTP/HTTPS URL |
+| `api_key` | `?string`，`null` | Elasticsearch 返回的 base64 `encoded` API Key |
+| `username` / `password` | `?string`，`null` | 必须成对配置，并与 `api_key` 互斥 |
+| `timeout` | 正整数，`10` | 单次请求总超时，单位为秒 |
+| `retries` | 非负整数，`1` | 官方 Transport 的网络失败重试次数；`0` 表示禁用 |
+| `verify_tls` | `bool|string`，`true` | TLS 校验开关，或可读 CA 文件/目录路径 |
+| `headers` | `array<string,string>`，`[]` | 附加请求 Header，不允许覆盖 `Authorization` |
+
+多连接通过 `connections` 配置，顶层 `default` 必须指向其中一个连接：
+
+```php
+return [
+    'default' => 'primary',
+    'connections' => [
+        'primary' => [
+            'hosts' => ['http://127.0.0.1:9200'],
+            'timeout' => 10,
+            'retries' => 1,
+            'verify_tls' => true,
+            'headers' => [],
+        ],
+        'archive' => [
+            'hosts' => ['https://archive.example.com:9200'],
+            'api_key' => env('ELASTICSEARCH_ARCHIVE_API_KEY'),
+            'timeout' => 20,
+            'retries' => 1,
+            'verify_tls' => true,
+            'headers' => [],
+        ],
+    ],
+];
+```
 
 ## 2. 客户端与连接管理
 
 ```php
 $manager = $container->get(\SllhSmile\Elasticsearch\Hyperf\Manager::class);
-$client = $manager->connection();                 // 默认 default；通常由模型自动解析
+$client = $manager->connection();                 // 顶层 default 指向的连接
 $archive = $manager->connection('archive');       // 命名连接
 $manager->purge('archive');                       // 丢弃一个缓存客户端
 $manager->purge();                                // 丢弃全部客户端
 ```
 
-`connection(?string $name): ElasticsearchClient` 按名称懒加载并缓存客户端；配置不存在时抛出 `InvalidArgumentException`。`purge` 不访问网络，只清理 Worker 内的客户端引用。多个连接互相隔离，适合不同集群或凭据。
+包只向 Hyperf 容器绑定 `Manager` 和它内部使用的 `ClientFactory`，不绑定“默认”
+`ElasticsearchClient` 或 `ClientInterface`。业务服务应注入 `Manager`，再显式调用 `connection()`，
+这样命名连接不会因容器别名而变得含糊。
 
-官方客户端的节点池可能在连接超时后把唯一节点标记为 dead。包在捕获传输层异常时会自动
-丢弃当前客户端，下一次请求重新创建 client/node pool，因此不需要重启整个 Hyperf Worker。
-失败请求本身不会被包自动重放，尤其是写入请求，避免网络超时但服务端已成功处理时造成重复写入。
-压测仍应保证 ES 集群、出口网络和连接/请求超时足够，并配置多个 hosts 以减少单节点故障影响。
+Manager 构造时会一次性校验顶层字段、默认连接、全部命名连接及认证/TLS 等配置，但不会创建
+HTTP Client 或访问网络。`connection(?string $name): ElasticsearchClient` 按名称懒加载并缓存客户端；
+配置不存在时抛出 `ConfigurationException`。`purge` 不访问网络，只清理 Worker 内的客户端引用，
+不会重新读取 Hyperf 配置。配置文件修改后仍需 reload/restart Worker。多个连接互相隔离，适合不同集群或凭据。
+
+Hyperf Manager 使用 `ElasticsearchClient::fromFactory()` 创建可恢复客户端。由于 Hyperf Guzzle
+在普通/native-cURL 与 `CoroutineHandler` 场景使用不同传输方式，同一个连接分别缓存这两个
+执行作用域的官方客户端，避免 Worker 首次调用发生在哪种环境就永久污染后续请求。包捕获明确的
+网络或节点故障后只丢弃当前作用域的实例，下一次请求重新创建 client/node pool；旧协程的失败
+也不会清除其他协程刚重建的健康实例。调用方通过 `ElasticsearchClient::fromClient()` 包装的
+固定官方客户端不会被替换。包不叠加额外重试，但官方 Transport 会按 `retries` 重试网络失败，
+可能重放服务端已经执行的写请求，因此写入应使用稳定 ID 或其他幂等设计。
 
 ## 3. 协程 HTTP
 
-在 Hyperf 协程中，官方工厂会自动使用 `CoroutineHandler`；如果 Swoole 已启用 native cURL hook，则使用 Guzzle cURL 的协程化路径。业务代码不需要手动创建 Handler 或客户端连接池。
+在 Hyperf 协程中，Hyperf Guzzle 工厂会自动使用 `CoroutineHandler`；如果 Swoole 已启用 native cURL hook，则使用 Guzzle cURL 的协程化路径。业务代码不需要手动创建 Handler 或客户端连接池。
 
 ```php
 // 同一个连接名：共享 Manager 缓存的 ElasticsearchClient。
@@ -52,6 +104,12 @@ Coroutine::create(fn () => Article::query()->count());
 ```
 
 HTTP 请求是否复用 TCP keep-alive 连接由 Handler 和服务端共同决定；业务代码不需要也不应该为每次查询手动 new 客户端。
+
+`Manager` 和它缓存的 `ElasticsearchClient` 设计为 Worker 内复用。`DocumentModel` 与 `QueryBuilder`
+保存可变的属性或 DSL 状态，只应在单次业务操作内使用；不要把它们放入单例属性，也不要让多个协程
+同时修改同一个实例。并发查询应像上例一样在各协程内分别调用 `Article::query()`。
+
+TLS 默认严格校验证书和主机名，并拒绝自签名证书。私有 CA 可以通过 `verify_tls` 指定可读的 CA 文件或目录；只有受控测试环境才应显式设为 `false`。`Authorization` Header 禁止通过 `headers` 覆盖，必须使用 `api_key` 或 Basic Auth 配置。
 
 ### Basic Auth 配置约束
 
@@ -66,7 +124,6 @@ use SllhSmile\Elasticsearch\Model\DocumentModel;
 final class Article extends DocumentModel
 {
     protected string $index = 'articles';
-    protected string $connection = 'default';
     protected array $casts = ['views' => 'int', 'published_at' => 'datetime'];
 
     public function mapping(): array { return ['properties' => ['title' => ['type' => 'text']]]; }
@@ -82,7 +139,12 @@ $article->toDocument();                      // 写入 ES 的文档数组
 Article::query();                            // 按模型 connection 自动解析
 ```
 
+模型不声明 `$connection` 时使用顶层 `default`；声明非空连接名时固定使用该命名连接。
+
 `getIndexName(): string` 返回索引名；未定义索引时抛出 `LogicException`。`getKey`、`exists`、`getScore`、`getSortValues`、`getHighlight` 分别读取 `_id`、命中状态、相关性分数、排序值和高亮结果。`fromSearchHit(SearchHit $hit): static` 会把 `_source` 和 hit 元数据转换为已存在模型。支持 `int`、`float`、`bool`、`array/json`、`datetime` casts。
+
+`mapping()` 和 `settings()` 只是供模型声明索引元数据的扩展钩子；模型 CRUD 不会读取它们，
+也不会自动创建或迁移索引。请在部署脚本或独立命令中把这些定义交给 `IndexManager` 执行。
 
 ### 4.1 文档模型写入、读取、更新和删除
 
@@ -103,11 +165,12 @@ $article->delete();
 $article = Article::find('article-1'); // 不存在时返回 null
 ```
 
-`create()` 和 `save()` 返回已经 hydrate 的模型，并将服务端返回的 `_id` 写回模型。已有 ID
+`create()` 和 `save()` 返回保留当前属性的模型，并将服务端返回的 `_id` 写回模型。已有 ID
 的 `save()` 使用 `index` 覆盖写入；没有 ID 时由 Elasticsearch 生成 ID。`update()` 是填充属性后
 再次保存完整文档的便捷方法，不模拟关系型数据库事务。`delete()` 成功后将 `exists()` 设为
-`false`。`find()` 会把 `_source` hydrate 到模型并执行入站 casts；HTTP 404 会转换为 `null`，
-其他服务端错误仍抛出 `ResponseException`。
+`false`。`find()` 会把 `_source` hydrate 到模型并执行入站 casts。只有响应明确包含
+`found: false` 的 HTTP 404 会转换为 `null`；索引不存在、无法识别的 404 和其他响应错误继续抛出
+`ResponseException`，避免把部署故障伪装成文档未命中。
 
 ### 4.2 QueryBuilder 写入和链式查询
 
@@ -129,29 +192,11 @@ foreach ($response->hits() as $article) {
 }
 ```
 
-`size()` 只限制当前页命中数，`SearchResponse::total()` 是 Elasticsearch 的匹配总数，
-`count($response)` 是当前页数量。深分页使用 `searchAfter()`/PIT；不要把 `from`/`size` 当作
-无限分页方案。
-
-### 4.3 Hyperf 测试控制器接口
-
-宿主示例 `IndexController` 仅用于开发验证，控制器内部只调用模型和 QueryBuilder：
-
-```bash
-curl -X POST http://127.0.0.1:9501/elasticsearch/test/write \
-  -H 'Content-Type: application/json' \
-  -d '{"id":"test-1","title":"Hyperf Elasticsearch","score":10,"created_at":"2026-09-07T12:00:00+08:00"}'
-
-curl 'http://127.0.0.1:9501/elasticsearch/test/read?id=test-1'
-curl 'http://127.0.0.1:9501/elasticsearch/test/search?keyword=Hyperf&min_score=1&size=20'
-```
-
-写入接口使用 `query()->create(..., ['refresh' => 'wait_for'])`，返回文档 ID、casts 后的
-文档和 `exists=true`。读取接口使用 `Model::find()`，模型不存在时返回业务 HTTP 404；
-搜索接口默认按 `created_at desc` 排序，`size` 最大为 100，返回 `total`、当前页 `count`、
-hydrate 后的 `models` 和 `aggregations`。传入 `debug=1` 时才额外返回完整原始响应 `raw`，
-便于开发排查 DSL 和 Elasticsearch 元数据；生产环境不要开启该参数。
-搜索接口不读取 `id` 参数；按 ID 读取请调用 `/elasticsearch/test/read?id=...`。
+`size()` 只限制当前页命中数，`count($response)` 是当前页数量。`SearchResponse::total()` 返回
+`?TotalHits`：`value` 是 Elasticsearch 报告的数量，`relation` 为 `TotalHitsRelation::Eq` 时是
+精确总数，为 `TotalHitsRelation::Gte` 时表示“至少有 value 条”。未请求总数时可能返回 `null`。
+需要精确总数时调用 `trackTotalHits(true)`，或直接使用 Builder 的 `count()`。深分页使用
+`searchAfter()`/PIT；不要把 `from`/`size` 当作无限分页方案。
 
 ## 5. QueryBuilder 基础条件
 
@@ -187,7 +232,6 @@ $response = Article::query()
 
 ```php
 $response = Article::query()
-    ->select(['title', 'views'])
     ->source(['title'], ['body'])
     ->orderBy('_score', 'desc')
     ->from(0)->size(20)->limit(20)
@@ -198,29 +242,38 @@ $response = Article::query()
     ->toDsl();
 ```
 
+只需要 includes 时可使用 `select(['title', 'views'])`；它与 `source()` 都设置 `_source`，后调用的
+方法会覆盖前一次设置，因此不要在同一调用链中同时使用。
+
 `orderBy($field, $direction, $options)` 只接受 `asc` 或 `desc`（大小写不敏感）。
 即使 `$options` 中包含 `order`，也不会覆盖已经校验的 `$direction`；其他排序选项如
 `mode`、`missing` 会原样保留。
 
-`toDsl(): array` 只编译，不访问网络；`replaceDsl` 会替换全部 raw DSL，`rawDsl` 递归合并但不允许覆盖链式 API 已生成的顶层键。需要完全覆盖时使用 `replaceDsl()`。`search(): SearchResponse` 将 DSL 放在各版本通用的 `body` 中；`get()` 是别名，`first()` 自动使用独立查询副本设置 `size(1)`，`count()` 自动使用独立查询副本设置 `size(0)` 并返回 `hits.total`。
+`toDsl(): array` 只编译，不访问网络。`rawDsl()` 递归合并多次传入的 raw 片段，但不允许覆盖链式 API 已生成的顶层键。需要完整控制请求体时，应在全新的 Builder 上直接调用 `rawDsl()`。链式 DSL 与 raw DSL 的同名顶层键内容不一致时，`toDsl()` 会抛出 `InvalidArgumentException`。
+
+`search(): SearchResponse` 将 DSL 放在各版本通用的 `body` 中；`get()` 是别名。`first()` 和 `count()` 会克隆 Builder，分别设置 `size(1)`、`size(0)`，因此不会修改原实例；如果 raw DSL 已经包含不同的 `size`，冲突检查仍会生效。
 
 ## 8. 深分页与 PIT
 
 ```php
 $pit = $client->pitManager()->open('articles', '2m');
 try {
-    $page = Article::query()->pit($pit, '2m')
+    $page = Article::query($client)->pit($pit, '2m')
         ->orderBy('_shard_doc')->size(100)->search();
-    $next = Article::query()->pit($pit, '2m')
-        ->orderBy('_shard_doc')->searchAfter($page->first()?->getSortValues() ?? [])->size(100)->search();
+    $last = $page->hits()[count($page) - 1] ?? null;
+    $next = $last === null ? null : Article::query($client)->pit($pit, '2m')
+        ->orderBy('_shard_doc')->searchAfter($last->getSortValues())->size(100)->search();
 } finally {
     $client->pitManager()->close($pit);
 }
 
-$client->pitManager()->using('articles', fn (string $id) => Article::query()->pit($id)->size(10)->search());
+$client->pitManager()->using(
+    'articles',
+    fn (string $id) => Article::query($client)->pit($id)->size(10)->search(),
+);
 ```
 
-`open`、`close`、`using` 都访问网络；关闭请求把 PIT ID 放入 `body.id`。`using` 使用 `finally`，即回调抛异常也会释放 PIT。
+`open`、`close`、`using` 都访问网络。PIT 搜索使用集群级 `/_search`，不会同时发送 index；关闭请求把 PIT ID 放入 `body.id`。`using` 无论回调成功或失败都会尝试关闭 PIT；若回调和关闭同时失败，保留回调异常，并通过可用的 PSR Logger 记录关闭失败。
 
 ## 9. 单文档写入
 
@@ -235,7 +288,7 @@ $client->update(['index' => 'articles', 'id' => 'a-1', 'body' => ['doc' => ['vie
 $client->delete(['index' => 'articles', 'id' => 'a-2']);
 ```
 
-这些方法是官方 ES7/8/9 endpoint 的轻量转发，参数中的文档内容必须放 `body`；冲突、未找到或权限错误会由适配器统一转换为本包的 `ResponseException` 或 `TransportException`。
+这些方法是官方 ES8/9 endpoint 的轻量转发，参数中的文档内容必须放 `body`。冲突、未找到、权限错误等服务端响应会转换为 `ResponseException`；明确的网络或节点故障才会转换为 `TransportException`。
 
 ## 10. Bulk 批量操作
 
@@ -288,26 +341,57 @@ create、putMapping、putSettings 和 updateAliases 的配置都放在 `body`；
 
 `SearchResponse` 提供 `hits()`、`first()`、`total()`、`maxScore()`、`aggregations()`、`raw()`、`count()`，可直接 `foreach`。每个 `SearchHit` 提供 `source`、`id`、`score`、`sort`、`highlight` 和 `raw` 公共只读属性。
 
-配置错误抛 `ConfigurationException`，网络/传输错误抛 `TransportException`，服务端响应错误可捕获 `ResponseException` 并读取 `statusCode()`、`response()`。
-所有通过包内 endpoint（查询、写入、Bulk、索引、PIT）发出的请求都会统一转换为这些包内异常，
-并将官方异常保存在 `getPrevious()`；因此业务层可以稳定按包内类型捕获。`raw()` 是官方客户端
-逃生入口，直接调用时仍会得到官方客户端异常。生产环境请记录 request id 和状态码，不要记录 ApiKey。
-
-## 13. 按 HTTP 方法发送 raw request 与测试
-
 ```php
-$client->requestGet('/');
-$client->requestPost('/articles/_search', [], ['query' => ['match_all' => (object) []]]);
-$client->requestPut('/articles-v2', [], ['settings' => ['number_of_shards' => 1]]);
-$client->requestDelete('/articles-v2');
+use SllhSmile\Elasticsearch\Response\TotalHitsRelation;
+
+$total = $response->total();
+if ($total !== null) {
+    echo $total->relation === TotalHitsRelation::Eq
+        ? "共 {$total->value} 条"
+        : "至少 {$total->value} 条";
+}
 ```
 
-`requestGet/requestPost/requestPut/requestDelete` 会把 body 传给官方 endpoint，并对 info、search、mapping、index、document、bulk 路由做显式分派，同时严格校验 HTTP 方法：根路径只允许 GET，search 只允许 GET/POST，mapping 只允许 GET/PUT，bulk 只允许 POST，文档路径只允许 GET/PUT/POST/DELETE；不支持的组合抛 `BadMethodCallException`。本地测试运行：
+`TotalHits::isExact()` 是判断 `relation === Eq` 的便捷方法。旧格式的整数 total 会按精确值解析；
+未知 relation 或无效结构会抛出 `UnexpectedValueException`，避免静默展示错误总数。
+
+配置错误抛 `ConfigurationException`，确定的网络/节点故障抛 `TransportException`，服务端响应错误
+可捕获 `ResponseException` 并读取 `statusCode()`、`response()`。官方 SDK 或 Transport 的参数、
+序列化等非网络错误会包装为 `ElasticsearchException`，但不会触发客户端重建。包内异常通过
+`getPrevious()` 保留原异常。
+
+`execute()` 回调中的业务异常、未知响应类型及不支持 operation 的 `BadMethodCallException` 保持
+原类型，避免把代码错误伪装成传输故障。生产环境请记录 request id 和状态码，不要记录 ApiKey。
+
+## 13. 高级 endpoint 与测试
+
+```php
+use Elastic\Elasticsearch\Client;
+
+$response = $client->execute(
+    static fn (Client $official) => $official->nodes()->stats(),
+);
+```
+
+`execute()` 的回调接收当前主版本的官方客户端，适合调用包尚未封装的 endpoint；返回类型仍由官方 SDK 决定，官方客户端异常遵循上一节的归一化规则，回调自身抛出的业务异常保持原类型。业务代码因此会与当前安装的 SDK 主版本耦合，不应把官方客户端对象保存到请求之外。本地测试运行：
 
 ```bash
 composer validate --no-check-publish --no-interaction
 composer test
-find src tests -type f -name '*.php' -print0 | xargs -0 -n1 php -l
+composer analyse
+composer cs-check
+find src tests benchmarks -type f -name '*.php' -print0 | xargs -0 -n1 php -l
 ```
 
-云端冒烟请通过临时 `ELASTICSEARCH_HOST`、`ELASTICSEARCH_API_KEY` 环境变量执行，测试索引使用唯一后缀并在结束后删除。
+CI 对 PHP/Hyperf/SDK 组合运行单元、静态分析和代码风格检查，并对 ES8、ES9 启动真实服务，通过包内工厂在协程中完成 CRUD、Bulk、Alias 和 PIT 冒烟。
+
+需要建立部署环境的并发基线时，可在安装 Swoole 且能够访问测试集群的环境运行：
+
+```bash
+ELASTICSEARCH_BENCHMARK_HOST=http://127.0.0.1:9200 \
+ELASTICSEARCH_BENCHMARK_REQUESTS=1000 \
+ELASTICSEARCH_BENCHMARK_CONCURRENCY=50 \
+php benchmarks/concurrent_search.php
+```
+
+脚本以固定数量的协程共享同一个客户端，输出成功数、失败数、失败异常类型、总吞吐以及成功请求的 P50/P95。它只调用 `info` endpoint，用于比较同一环境在代码或配置变更前后的基线，不代替针对真实查询 DSL 和数据规模的容量测试。

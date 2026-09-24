@@ -11,6 +11,7 @@ use SllhSmile\Elasticsearch\Contract\ClientInterface;
 use SllhSmile\Elasticsearch\Exception\ResponseException;
 use SllhSmile\Elasticsearch\Hyperf\Manager;
 use SllhSmile\Elasticsearch\Response\SearchHit;
+use Throwable;
 
 /**
  * 面向 Elasticsearch 文档的轻量模型基类，不依赖 Laravel/Eloquent。
@@ -22,13 +23,13 @@ abstract class DocumentModel
 {
     protected string $index = '';
 
-    /** 当前模型使用的连接名，默认读取 elasticsearch.connections.default。 */
-    protected string $connection = 'default';
+    /** 空字符串表示使用 Manager 声明的顶层默认连接。 */
+    protected string $connection = '';
 
-    protected string $idField = '_id';
-
+    /** @var array<string, string> */
     protected array $casts = [];
 
+    /** @var array<string, mixed> */
     protected array $attributes = [];
 
     protected bool $exists = false;
@@ -37,14 +38,13 @@ abstract class DocumentModel
 
     protected ?float $score = null;
 
+    /** @var list<mixed> */
     protected array $sortValues = [];
 
+    /** @var array<string, mixed> */
     protected array $highlight = [];
 
-    /** @var array<class-string, ClientInterface> */
-    private static array $clients = [];
-
-    /** 创建模型并填充初始属性；不会访问网络。 */
+    /** @param array<string, mixed> $attributes */
     public function __construct(array $attributes = [])
     {
         $this->fill($attributes);
@@ -59,10 +59,10 @@ abstract class DocumentModel
         return $this->index;
     }
 
-    /** 返回模型声明的连接名；空值时统一回退到 default。 */
-    public function getConnectionName(): string
+    /** 返回显式连接名；null 表示交由 Manager 解析顶层默认连接。 */
+    public function getConnectionName(): ?string
     {
-        return $this->connection !== '' ? $this->connection : 'default';
+        return $this->connection !== '' ? $this->connection : null;
     }
 
     /** 返回搜索命中的文档 id。 */
@@ -90,19 +90,19 @@ abstract class DocumentModel
         return $this->score;
     }
 
-    /** 返回 search_after 所需的排序值。 */
+    /** @return list<mixed> */
     public function getSortValues(): array
     {
         return $this->sortValues;
     }
 
-    /** 返回字段高亮片段。 */
+    /** @return array<string, mixed> */
     public function getHighlight(): array
     {
         return $this->highlight;
     }
 
-    /** 批量填充属性并执行入站 casts。 */
+    /** @param array<string, mixed> $attributes */
     public function fill(array $attributes): static
     {
         foreach ($attributes as $key => $value) {
@@ -121,10 +121,10 @@ abstract class DocumentModel
     /** 读取属性，不存在时返回默认值。 */
     public function getAttribute(string $key, mixed $default = null): mixed
     {
-        return $this->attributes[$key] ?? $default;
+        return array_key_exists($key, $this->attributes) ? $this->attributes[$key] : $default;
     }
 
-    /** 导出属性并执行出站 casts，适合返回 API。 */
+    /** @return array<string, mixed> */
     public function toArray(): array
     {
         $result = [];
@@ -134,13 +134,18 @@ abstract class DocumentModel
         return $result;
     }
 
-    /** 导出写入 ES 的文档 body。 */
+    /** @return array<string, mixed> */
     public function toDocument(): array
     {
         return $this->toArray();
     }
 
-    /** 创建并写入一个新文档，返回已标记为存在的模型实例。 */
+    /**
+     * 创建并写入一个新文档，返回已标记为存在的模型实例。
+     *
+     * @param array<string, mixed> $attributes
+     * @param array<string, mixed> $options
+     */
     public static function create(array $attributes, ?string $id = null, ?ClientInterface $client = null, array $options = []): static
     {
         $model = new static($attributes);
@@ -150,7 +155,7 @@ abstract class DocumentModel
         return $model->save($client, $options);
     }
 
-    /** 保存当前文档；有 ID 时执行 index 覆盖写入，否则由 ES 自动生成 ID。 */
+    /** @param array<string, mixed> $options */
     public function save(?ClientInterface $client = null, array $options = []): static
     {
         $client ??= $this->resolveClient();
@@ -169,7 +174,7 @@ abstract class DocumentModel
         return $this;
     }
 
-    /** 按 ES 文档 ID 读取并 hydrate 模型，不存在时返回 null。 */
+    /** 按 ES 文档 ID 读取并 hydrate 模型；只有明确的文档未命中返回 null。 */
     public static function find(string $id, ?ClientInterface $client = null): ?static
     {
         $model = new static();
@@ -180,7 +185,7 @@ abstract class DocumentModel
                 'id' => $id,
             ]));
         } catch (ResponseException $exception) {
-            if ($exception->statusCode() === 404) {
+            if ($exception->statusCode() === 404 && self::isDocumentNotFoundResponse($exception->response())) {
                 return null;
             }
             throw $exception;
@@ -194,14 +199,19 @@ abstract class DocumentModel
         return $model;
     }
 
-    /** 更新属性并保存完整文档；Elasticsearch index 语义会覆盖当前文档。 */
+    /**
+     * 更新属性并保存完整文档；Elasticsearch index 语义会覆盖当前文档。
+     *
+     * @param array<string, mixed> $attributes
+     * @param array<string, mixed> $options
+     */
     public function update(array $attributes, ?ClientInterface $client = null, array $options = []): static
     {
         $this->fill($attributes);
         return $this->save($client, $options);
     }
 
-    /** 删除当前文档；未保存模型不能删除。 */
+    /** @param array<string, mixed> $options */
     public function delete(?ClientInterface $client = null, array $options = []): bool
     {
         if ($this->documentId === null) {
@@ -216,32 +226,23 @@ abstract class DocumentModel
         return ($raw['result'] ?? null) === 'deleted' || ($raw['deleted'] ?? false) === true;
     }
 
-    /** 子类可覆盖以声明索引 mapping。 */
+    /** @return array<string, mixed> */
     public function mapping(): array
     {
         return [];
     }
 
-    /** 子类可覆盖以声明索引 settings。 */
+    /** @return array<string, mixed> */
     public function settings(): array
     {
         return [];
     }
 
-    /** 按具体模型类保存默认客户端，避免不同模型相互覆盖。 */
-    public static function setClient(ClientInterface $client): void
-    {
-        self::$clients[static::class] = $client;
-    }
-
-    /** 创建绑定当前模型索引的 QueryBuilder；传入 client 可覆盖静态默认值。 */
+    /** 创建绑定当前模型索引的 QueryBuilder；容器外调用必须显式传入 client。 */
     public static function query(?ClientInterface $client = null): QueryBuilder
     {
         $model = new static();
-        $client ??= self::$clients[static::class] ?? null;
-        if ($client === null) {
-            $client = self::resolveClientForConnection($model->getConnectionName());
-        }
+        $client ??= self::resolveClientForConnection($model->getConnectionName());
         if ($client === null) {
             throw new \LogicException('No Elasticsearch client has been configured for the model.');
         }
@@ -250,9 +251,9 @@ abstract class DocumentModel
 
     /**
      * 从 Hyperf 当前应用容器解析连接客户端。
-     * 该路径只在模型未显式传入客户端且未调用 setClient 时执行。
+     * 该路径只在模型未显式传入客户端时执行。
      */
-    private static function resolveClientForConnection(string $connection): ?ClientInterface
+    private static function resolveClientForConnection(?string $connection): ?ClientInterface
     {
         if (! ApplicationContext::hasContainer()) {
             return null;
@@ -269,12 +270,59 @@ abstract class DocumentModel
     /** 解析当前模型声明的连接。 */
     private function resolveClient(): ClientInterface
     {
-        $client = self::$clients[static::class]
-            ?? self::resolveClientForConnection($this->getConnectionName());
+        $client = self::resolveClientForConnection($this->getConnectionName());
         if ($client === null) {
             throw new \LogicException('No Elasticsearch client has been configured for the model.');
         }
         return $client;
+    }
+
+    /** 判断 404 响应是否明确表示文档不存在，避免隐藏索引缺失等部署错误。 */
+    private static function isDocumentNotFoundResponse(mixed $response): bool
+    {
+        $payload = self::responsePayload($response);
+        return $payload !== null
+            && ($payload['found'] ?? null) === false
+            && ! array_key_exists('error', $payload);
+    }
+
+    /**
+     * 将异常中保留的数组、SDK 响应或 PSR-7 响应解析为错误载荷。
+     *
+     * @return null|array<string, mixed>
+     */
+    private static function responsePayload(mixed $response): ?array
+    {
+        if (is_array($response)) {
+            return $response;
+        }
+        if (! is_object($response)) {
+            return null;
+        }
+
+        foreach (['asArray', 'toArray'] as $method) {
+            if (! method_exists($response, $method)) {
+                continue;
+            }
+            try {
+                $payload = $response->{$method}();
+                if (is_array($payload)) {
+                    return $payload;
+                }
+            } catch (Throwable) {
+                // 继续尝试 PSR-7 body；无法识别时保留原异常。
+            }
+        }
+
+        if (! method_exists($response, 'getBody')) {
+            return null;
+        }
+        try {
+            $payload = json_decode((string) $response->getBody(), true, 512, JSON_THROW_ON_ERROR);
+            return is_array($payload) ? $payload : null;
+        } catch (Throwable) {
+            return null;
+        }
     }
 
     /** 将 SearchHit 转换为已存在模型并复制 score/sort/highlight 元数据。 */
@@ -310,10 +358,14 @@ abstract class DocumentModel
     /** 根据 casts 将 ES/调用方输入转换为 PHP 属性值。 */
     protected function castInbound(string $key, mixed $value): mixed
     {
+        // 与常见 ORM cast 语义一致：显式 null 不应被转换为 false、空数组或当前时间。
+        if ($value === null) {
+            return null;
+        }
         $cast = $this->casts[$key] ?? null;
         return match ($cast) {
-            'int', 'integer' => $value === null ? null : (int) $value,
-            'float', 'double' => $value === null ? null : (float) $value,
+            'int', 'integer' => (int) $value,
+            'float', 'double' => (float) $value,
             'bool', 'boolean' => (bool) $value,
             'array', 'json' => is_array($value) ? $value : (array) $value,
             'datetime' => $value instanceof DateTimeInterface ? $value : new \DateTimeImmutable((string) $value),

@@ -2,29 +2,33 @@
     "name": "sllhsmile/hyperf-elasticsearch",
     "description": "Hyperf Elasticsearch ORM-style client and query builder.",
     "type": "library",
-    "keywords": ["hyperf", "elasticsearch", "search", "orm", "query-builder"],
+    "keywords": [
+        "hyperf",
+        "elasticsearch",
+        "search",
+        "orm",
+        "query-builder"
+    ],
     "license": "MIT",
-    "authors": [{"name": "sllhSmile"}],
+    "authors": [
+        {
+            "name": "sllhSmile"
+        }
+    ],
     "require": {
         "php": ">=8.1",
-        "elasticsearch/elasticsearch": "^7.17 || ^8.0 || ^9.0",
-        "hyperf/context": "^3.0",
+        "elasticsearch/elasticsearch": "^8.0 || ^9.0",
         "hyperf/config": "^3.0",
-        "hyperf/di": "^3.0",
-        "hyperf/elasticsearch": "^3.0",
-        "hyperf/guzzle": "^3.0"
+        "hyperf/context": "^3.0",
+        "hyperf/guzzle": "^3.0",
+        "psr/container": "^1.0 || ^2.0",
+        "psr/log": "^1.1 || ^2.0 || ^3.0"
     },
     "require-dev": {
         "phpunit/phpunit": "^10.5 || ^11.0",
         "phpstan/phpstan": "^1.10 || ^2.0",
         "friendsofphp/php-cs-fixer": "^3.68"
     },
-    "repositories": [
-        {
-            "type": "composer",
-            "url": "https://repo.packagist.org"
-        }
-    ],
     "autoload": {
         "psr-4": {
             "SllhSmile\\Elasticsearch\\": "src/"
@@ -43,10 +47,9 @@
     "scripts": {
         "test": "phpunit -c phpunit.xml",
         "analyse": "phpstan analyse -c phpstan.neon",
+        "cs-check": "php-cs-fixer fix --dry-run --diff --using-cache=no",
         "cs-fix": "php-cs-fixer fix"
     },
-    "minimum-stability": "stable",
-    "prefer-stable": true,
     "config": {
         "sort-packages": true
     }
